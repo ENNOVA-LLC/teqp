@@ -113,9 +113,10 @@ auto get_JDQ_3ijk(const Eta& eta, const MType& mijk) {
 class DipolarContributionGrossVrabec {
 private:
     const Eigen::ArrayXd m, sigma_Angstrom, epsilon_over_k, mustar2, nmu;
+    const SigmaijRule sigmaij_rule;
 public:
     const bool has_a_polar;
-    DipolarContributionGrossVrabec(const Eigen::ArrayX<double> &m, const Eigen::ArrayX<double> &sigma_Angstrom, const Eigen::ArrayX<double> &epsilon_over_k, const Eigen::ArrayX<double> &mustar2, const Eigen::ArrayX<double> &nmu) : m(m), sigma_Angstrom(sigma_Angstrom), epsilon_over_k(epsilon_over_k), mustar2(mustar2), nmu(nmu), has_a_polar(mustar2.cwiseAbs().sum() > 0) {
+    DipolarContributionGrossVrabec(const Eigen::ArrayX<double> &m, const Eigen::ArrayX<double> &sigma_Angstrom, const Eigen::ArrayX<double> &epsilon_over_k, const Eigen::ArrayX<double> &mustar2, const Eigen::ArrayX<double> &nmu, SigmaijRule sigmaij_rule = SigmaijRule::arithmetic) : m(m), sigma_Angstrom(sigma_Angstrom), epsilon_over_k(epsilon_over_k), mustar2(mustar2), nmu(nmu), sigmaij_rule(sigmaij_rule), has_a_polar(mustar2.cwiseAbs().sum() > 0) {
         // Check lengths match
         if (m.size() != mustar2.size()){
             throw teqp::InvalidArgument("bad size of mustar2");
@@ -124,7 +125,18 @@ public:
             throw teqp::InvalidArgument("bad size of n");
         }
     }
-    
+
+    /// Cross-pair segment diameter under the active combining rule.
+    /// ``arithmetic`` reproduces stock Lorentz-Berthelot; ``geometric``
+    /// switches to Marshall's sqrt(sigma_i * sigma_j).  Pure-component
+    /// sigma_ii is identical in both branches.
+    inline double sigma_ij(std::size_t i, std::size_t j) const {
+        if (sigmaij_rule == SigmaijRule::geometric) {
+            return sqrt(sigma_Angstrom[i] * sigma_Angstrom[j]);
+        }
+        return 0.5 * (sigma_Angstrom[i] + sigma_Angstrom[j]);
+    }
+
     /// Eq. 8 from Gross and Vrabec
     template<typename TTYPE, typename RhoType, typename EtaType, typename VecType>
     auto get_alpha2DD(const TTYPE& T, const RhoType& rhoN_A3, const EtaType& eta, const VecType& mole_fractions) const{
@@ -136,10 +148,11 @@ public:
             for (auto j = 0; j < N; ++j){
                 auto ninj = nmu[i]*nmu[j];
                 if (ninj > 0){
-                    // Lorentz-Berthelot mixing rules
+                    // epsilon mixing remains geometric (Lorentz-Berthelot);
+                    // sigma_ij follows the active combining-rule selector.
                     auto epskij = sqrt(epsilon_over_k[i]*epsilon_over_k[j]);
-                    auto sigmaij = (sigma[i]+sigma[j])/2;
-                    
+                    auto sigmaij = sigma_ij(i, j);
+
                     auto Tstarij = forceeval(T/epskij);
                     auto mij = std::min(sqrt(m[i]*m[j]), 2.0);
                     summer += x[i]*x[j]*epsilon_over_k[i]/T*epsilon_over_k[j]/T*POW3(sigma[i]*sigma[j]/sigmaij)*ninj*mustar2[i]*mustar2[j]*get_JDD_2ij(eta, mij, Tstarij);
@@ -148,7 +161,7 @@ public:
         }
         return forceeval(-static_cast<double>(EIGEN_PI)*rhoN_A3*summer);
     }
-    
+
     /// Eq. 9 from Gross and Vrabec
     template<typename TTYPE, typename RhoType, typename EtaType, typename VecType>
     auto get_alpha3DD(const TTYPE& T, const RhoType& rhoN_A3, const EtaType& eta, const VecType& mole_fractions) const{
@@ -161,11 +174,10 @@ public:
                 for (auto k = 0; k < N; ++k){
                     auto ninjnk = nmu[i]*nmu[j]*nmu[k];
                     if (ninjnk > 0){
-                        // Lorentz-Berthelot mixing rules for sigma
-                        auto sigmaij = (sigma[i]+sigma[j])/2;
-                        auto sigmaik = (sigma[i]+sigma[k])/2;
-                        auto sigmajk = (sigma[j]+sigma[k])/2;
-                        
+                        auto sigmaij = sigma_ij(i, j);
+                        auto sigmaik = sigma_ij(i, k);
+                        auto sigmajk = sigma_ij(j, k);
+
                         auto mijk = std::min(pow(m[i]*m[j]*m[k], 1.0/3.0), 2.0);
                         summer += x[i]*x[j]*x[k]*epsilon_over_k[i]/T*epsilon_over_k[j]/T*epsilon_over_k[k]/T*POW3(sigma[i]*sigma[j]*sigma[k])/(sigmaij*sigmaik*sigmajk)*ninjnk*mustar2[i]*mustar2[j]*mustar2[k]*get_JDD_3ijk(eta, mijk);
                     }
@@ -203,10 +215,11 @@ public:
 class QuadrupolarContributionGross {
 private:
     const Eigen::ArrayXd m, sigma_Angstrom, epsilon_over_k, Qstar2, nQ;
-    
+    const SigmaijRule sigmaij_rule;
+
 public:
     const bool has_a_polar;
-    QuadrupolarContributionGross(const Eigen::ArrayX<double> &m, const Eigen::ArrayX<double> &sigma_Angstrom, const Eigen::ArrayX<double> &epsilon_over_k, const Eigen::ArrayX<double> &Qstar2, const Eigen::ArrayX<double> &nQ) : m(m), sigma_Angstrom(sigma_Angstrom), epsilon_over_k(epsilon_over_k), Qstar2(Qstar2), nQ(nQ), has_a_polar(Qstar2.cwiseAbs().sum() > 0) {
+    QuadrupolarContributionGross(const Eigen::ArrayX<double> &m, const Eigen::ArrayX<double> &sigma_Angstrom, const Eigen::ArrayX<double> &epsilon_over_k, const Eigen::ArrayX<double> &Qstar2, const Eigen::ArrayX<double> &nQ, SigmaijRule sigmaij_rule = SigmaijRule::arithmetic) : m(m), sigma_Angstrom(sigma_Angstrom), epsilon_over_k(epsilon_over_k), Qstar2(Qstar2), nQ(nQ), sigmaij_rule(sigmaij_rule), has_a_polar(Qstar2.cwiseAbs().sum() > 0) {
         // Check lengths match
         if (m.size() != Qstar2.size()){
             throw teqp::InvalidArgument("bad size of mustar2");
@@ -216,7 +229,15 @@ public:
         }
     }
     QuadrupolarContributionGross& operator=( const QuadrupolarContributionGross& ) = delete; // non copyable
-    
+
+    /// See DipolarContributionGrossVrabec::sigma_ij for the rule semantics.
+    inline double sigma_ij(std::size_t i, std::size_t j) const {
+        if (sigmaij_rule == SigmaijRule::geometric) {
+            return sqrt(sigma_Angstrom[i] * sigma_Angstrom[j]);
+        }
+        return 0.5 * (sigma_Angstrom[i] + sigma_Angstrom[j]);
+    }
+
     /// Eq. 9 from Gross, AICHEJ, doi: 10.1002/aic.10502
     template<typename TTYPE, typename RhoType, typename EtaType, typename VecType>
     auto get_alpha2QQ(const TTYPE& T, const RhoType& rhoN_A3, const EtaType& eta, const VecType& mole_fractions) const{
@@ -228,10 +249,11 @@ public:
             for (auto j = 0; j < N; ++j){
                 auto ninj = nQ[i]*nQ[j];
                 if (ninj > 0){
-                    // Lorentz-Berthelot mixing rules
+                    // epsilon mixing remains geometric (Lorentz-Berthelot);
+                    // sigma_ij follows the active combining-rule selector.
                     auto epskij = sqrt(epsilon_over_k[i]*epsilon_over_k[j]);
-                    auto sigmaij = (sigma[i]+sigma[j])/2;
-                    
+                    auto sigmaij = sigma_ij(i, j);
+
                     auto Tstarij = forceeval(T/epskij);
                     auto mij = std::min(sqrt(m[i]*m[j]), 2.0);
                     summer += x[i]*x[j]*epsilon_over_k[i]/T*epsilon_over_k[j]/T*POW5(sigma[i]*sigma[j])/POW7(sigmaij)*ninj*Qstar2[i]*Qstar2[j]*get_JQQ_2ij(eta, mij, Tstarij);
@@ -240,7 +262,7 @@ public:
         }
         return forceeval(-static_cast<double>(EIGEN_PI)*POW2(3.0/4.0)*rhoN_A3*summer);
     }
-    
+
     /// Eq. 10 from Gross, AICHEJ, doi: 10.1002/aic.10502
     template<typename TTYPE, typename RhoType, typename EtaType, typename VecType>
     auto get_alpha3QQ(const TTYPE& T, const RhoType& rhoN_A3, const EtaType& eta, const VecType& mole_fractions) const{
@@ -253,11 +275,10 @@ public:
                 for (std::size_t k = 0; k < N; ++k){
                     auto ninjnk = nQ[i]*nQ[j]*nQ[k];
                     if (ninjnk > 0){
-                        // Lorentz-Berthelot mixing rules for sigma
-                        auto sigmaij = (sigma[i]+sigma[j])/2;
-                        auto sigmaik = (sigma[i]+sigma[k])/2;
-                        auto sigmajk = (sigma[j]+sigma[k])/2;
-                        
+                        auto sigmaij = sigma_ij(i, j);
+                        auto sigmaik = sigma_ij(i, k);
+                        auto sigmajk = sigma_ij(j, k);
+
                         auto mijk = std::min(pow(m[i]*m[j]*m[k], 1.0/3.0), 2.0);
                         summer += x[i]*x[j]*x[k]*epsilon_over_k[i]/T*epsilon_over_k[j]/T*epsilon_over_k[k]/T*POW5(sigma[i]*sigma[j]*sigma[k])/POW3(sigmaij*sigmaik*sigmajk)*ninjnk*Qstar2[i]*Qstar2[j]*Qstar2[k]*get_JDD_3ijk(eta, mijk);
                     }
@@ -297,7 +318,8 @@ public:
 class DipolarQuadrupolarContributionVrabecGross {
 private:
     const Eigen::ArrayXd m, sigma_Angstrom, epsilon_over_k, mustar2, nmu, Qstar2, nQ;
-    
+    const SigmaijRule sigmaij_rule;
+
 public:
     DipolarQuadrupolarContributionVrabecGross(
       const Eigen::ArrayX<double> &m,
@@ -306,8 +328,9 @@ public:
       const Eigen::ArrayX<double> &mustar2,
       const Eigen::ArrayX<double> &nmu,
       const Eigen::ArrayX<double> &Qstar2,
-      const Eigen::ArrayX<double> &nQ
-    ) : m(m), sigma_Angstrom(sigma_Angstrom), epsilon_over_k(epsilon_over_k), mustar2(mustar2), nmu(nmu), Qstar2(Qstar2), nQ(nQ) {
+      const Eigen::ArrayX<double> &nQ,
+      SigmaijRule sigmaij_rule = SigmaijRule::arithmetic
+    ) : m(m), sigma_Angstrom(sigma_Angstrom), epsilon_over_k(epsilon_over_k), mustar2(mustar2), nmu(nmu), Qstar2(Qstar2), nQ(nQ), sigmaij_rule(sigmaij_rule) {
         // Check lengths match
         if (m.size() != Qstar2.size()){
             throw teqp::InvalidArgument("bad size of Qstar2");
@@ -326,7 +349,15 @@ public:
         }
     }
     DipolarQuadrupolarContributionVrabecGross& operator=( const DipolarQuadrupolarContributionVrabecGross& ) = delete; // non copyable
-    
+
+    /// See DipolarContributionGrossVrabec::sigma_ij for the rule semantics.
+    inline double sigma_ij(std::size_t i, std::size_t j) const {
+        if (sigmaij_rule == SigmaijRule::geometric) {
+            return sqrt(sigma_Angstrom[i] * sigma_Angstrom[j]);
+        }
+        return 0.5 * (sigma_Angstrom[i] + sigma_Angstrom[j]);
+    }
+
     /// Eq. 14 from Vrabec and Gross
     template<typename TTYPE, typename RhoType, typename EtaType, typename VecType>
     auto get_alpha2DQ(const TTYPE& T, const RhoType& rhoN_A3, const EtaType& eta, const VecType& mole_fractions) const{
@@ -338,10 +369,11 @@ public:
             for (auto j = 0; j < N; ++j){
                 auto ninj = nmu[i]*nQ[j];
                 if (ninj > 0){
-                    // Lorentz-Berthelot mixing rules
+                    // epsilon mixing remains geometric (Lorentz-Berthelot);
+                    // sigma_ij follows the active combining-rule selector.
                     auto epskij = sqrt(epsilon_over_k[i]*epsilon_over_k[j]);
-                    auto sigmaij = (sigma[i]+sigma[j])/2;
-                    
+                    auto sigmaij = sigma_ij(i, j);
+
                     auto Tstarij = forceeval(T/epskij);
                     auto mij = std::min(sqrt(m[i]*m[j]), 2.0);
                     summer += x[i]*x[j]*epsilon_over_k[i]/T*epsilon_over_k[j]/T*POW3(sigma[i])*POW5(sigma[j])/POW5(sigmaij)*ninj*mustar2[i]*Qstar2[j]*get_JDQ_2ij(eta, mij, Tstarij);
@@ -350,7 +382,7 @@ public:
         }
         return forceeval(-static_cast<double>(EIGEN_PI)*9.0/4.0*rhoN_A3*summer);
     }
-    
+
     /// Eq. 15 from Vrabec and Gross
     template<typename TTYPE, typename RhoType, typename EtaType, typename VecType>
     auto get_alpha3DQ(const TTYPE& T, const RhoType& rhoN_A3, const EtaType& eta, const VecType& mole_fractions) const{
@@ -364,11 +396,10 @@ public:
                     auto ninjnk1 = nmu[i]*nmu[j]*nQ[k];
                     auto ninjnk2 = nmu[i]*nQ[j]*nQ[k];
                     if (ninjnk1 > 0 || ninjnk2 > 0){
-                        // Lorentz-Berthelot mixing rules for sigma
-                        auto sigmaij = (sigma[i]+sigma[j])/2;
-                        auto sigmaik = (sigma[i]+sigma[k])/2;
-                        auto sigmajk = (sigma[j]+sigma[k])/2;
-                        
+                        auto sigmaij = sigma_ij(i, j);
+                        auto sigmaik = sigma_ij(i, k);
+                        auto sigmajk = sigma_ij(j, k);
+
                         auto mijk = std::min(pow(m[i]*m[j]*m[k], 1.0/3.0), 2.0);
                         double alpha_GV = 1.19374; // Table 3
                         auto polars = ninjnk1*mustar2[i]*mustar2[j]*Qstar2[k] + ninjnk2*alpha_GV*mustar2[i]*Qstar2[j]*Qstar2[k];
@@ -430,10 +461,11 @@ public:
       const Eigen::ArrayX<double> &mustar2,
       const Eigen::ArrayX<double> &nmu,
       const Eigen::ArrayX<double> &Qstar2,
-      const Eigen::ArrayX<double> &nQ)
-    : di((((nmu*mustar2 > 0).cast<int>().sum() > 0) ? decltype(di)(DipolarContributionGrossVrabec(m, sigma_Angstrom, epsilon_over_k, mustar2, nmu)) : std::nullopt)),
-      quad((((nQ*Qstar2 > 0).cast<int>().sum() > 0) ? decltype(quad)(QuadrupolarContributionGross(m, sigma_Angstrom, epsilon_over_k, Qstar2, nQ)) : std::nullopt)),
-      diquad((di && quad) ? decltype(diquad)(DipolarQuadrupolarContributionVrabecGross(m, sigma_Angstrom, epsilon_over_k, mustar2, nmu, Qstar2, nQ)) : std::nullopt)
+      const Eigen::ArrayX<double> &nQ,
+      SigmaijRule sigmaij_rule = SigmaijRule::arithmetic)
+    : di((((nmu*mustar2 > 0).cast<int>().sum() > 0) ? decltype(di)(DipolarContributionGrossVrabec(m, sigma_Angstrom, epsilon_over_k, mustar2, nmu, sigmaij_rule)) : std::nullopt)),
+      quad((((nQ*Qstar2 > 0).cast<int>().sum() > 0) ? decltype(quad)(QuadrupolarContributionGross(m, sigma_Angstrom, epsilon_over_k, Qstar2, nQ, sigmaij_rule)) : std::nullopt)),
+      diquad((di && quad) ? decltype(diquad)(DipolarQuadrupolarContributionVrabecGross(m, sigma_Angstrom, epsilon_over_k, mustar2, nmu, Qstar2, nQ, sigmaij_rule)) : std::nullopt)
     {};
     
     template<typename TTYPE, typename RhoType, typename EtaType, typename VecType>

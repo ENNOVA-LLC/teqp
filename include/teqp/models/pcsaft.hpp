@@ -13,6 +13,7 @@
 #include "teqp/json_tools.hpp"
 #include "teqp/models/saft/pcsaftpure.hpp"
 #include "teqp/models/saft/polar_terms/GrossVrabec.hpp"
+#include "teqp/models/saft/polar_terms/JogChapman.hpp"
 #include <optional>
 
 // Definitions for the matrices of global constants for the PCSAFT model
@@ -39,9 +40,10 @@ struct SAFTCoeffs {
         sigma_Angstrom = -1, ///< [A] segment diameter
         epsilon_over_k = -1; ///< [K] depth of pair potential divided by Boltzman constant
     std::string BibTeXKey; ///< The BibTeXKey for the reference for these coefficients
-    double mustar2 = 0, ///< nondimensional, the reduced dipole moment squared
-           nmu = 0, ///< number of dipolar segments
-           Qstar2 = 0, ///< nondimensional, the reduced quadrupole squared
+    double mustar2 = 0, ///< non-dimensional, the reduced dipole moment squared
+           nmu = 0, ///< number of dipolar segments (Gross-Vrabec convention)
+           xp = 0, ///< fraction of dipolar segments on the chain (Jog-Chapman convention; xp = nmu/m for consistency)
+           Qstar2 = 0, ///< non-dimensional, the reduced quadrupole squared
            nQ = 0; ///< number of quadrupolar segments
 };
 
@@ -185,22 +187,37 @@ auto sumproduct(const VecType1& v1, const VecType2& v2, const VecType3& v3) {
  * \brief This class provides the evaluation of the hard chain contribution from classic PC-SAFT
  */
 class PCSAFTHardChainContribution{
-    
+
 protected:
     const Eigen::ArrayX<double> m, ///< number of segments
         mminus1, ///< m-1
         sigma_Angstrom, ///<
-        epsilon_over_k; ///< depth of pair potential divided by Boltzman constant
+        epsilon_over_k; ///< depth of pair potential divided by Boltzmann constant
     const Eigen::ArrayXXd kmat; ///< binary interaction parameter matrix
     Eigen::Array<double, 3, 7> a, ///< The universal constants used in Eqn. A.18 of G&S
                             b; ///< The universal constants used in Eqn. A.19 of G&S
+    const teqp::saft::polar_terms::SigmaijRule sigmaij_rule;
+        ///< Combining rule for sigma_ij inside the dispersion double sum.
+        ///< - ``arithmetic`` (default) reproduces stock PC-SAFT (Lorentz-Berthelot);
+        ///< - ``geometric`` is the Marshall convention sqrt(sigma_i*sigma_j).
+        ///< Pure-component results are unchanged; mixture results shift when
+        ///< components have asymmetric size.
 
 public:
-    PCSAFTHardChainContribution(const Eigen::ArrayX<double> &m, const Eigen::ArrayX<double> &mminus1, const Eigen::ArrayX<double> &sigma_Angstrom, const Eigen::ArrayX<double> &epsilon_over_k, const Eigen::ArrayXXd &kmat, const Eigen::Array<double, 3, 7>&a, const Eigen::Array<double, 3,7>&b)
-    : m(m), mminus1(mminus1), sigma_Angstrom(sigma_Angstrom), epsilon_over_k(epsilon_over_k), kmat(kmat), a(a), b(b) {}
-    
+    PCSAFTHardChainContribution(const Eigen::ArrayX<double> &m, const Eigen::ArrayX<double> &mminus1, const Eigen::ArrayX<double> &sigma_Angstrom, const Eigen::ArrayX<double> &epsilon_over_k, const Eigen::ArrayXXd &kmat, const Eigen::Array<double, 3, 7>&a, const Eigen::Array<double, 3,7>&b, teqp::saft::polar_terms::SigmaijRule sigmaij_rule = teqp::saft::polar_terms::SigmaijRule::arithmetic)
+    : m(m), mminus1(mminus1), sigma_Angstrom(sigma_Angstrom), epsilon_over_k(epsilon_over_k), kmat(kmat), a(a), b(b), sigmaij_rule(sigmaij_rule) {}
+
     PCSAFTHardChainContribution& operator=( const PCSAFTHardChainContribution& ) = delete; // non copyable
-    
+
+    /// Combining rule for sigma_ij in the dispersion accumulators.
+    /// Pure-components (i==j) collapse to sigma_i in both rules.
+    inline double pair_sigma(std::size_t i, std::size_t j) const {
+        if (sigmaij_rule == teqp::saft::polar_terms::SigmaijRule::geometric) {
+            return sqrt(sigma_Angstrom[i] * sigma_Angstrom[j]);
+        }
+        return 0.5 * (sigma_Angstrom[i] + sigma_Angstrom[j]);
+    }
+
     template<typename TTYPE, typename RhoType, typename VecType>
     auto eval(const TTYPE& T, const RhoType& rhomolar, const VecType& mole_fractions) const {
         
@@ -213,18 +230,68 @@ public:
         using TRHOType = std::common_type_t<std::decay_t<TTYPE>, std::decay_t<RhoType>, std::decay_t<decltype(mole_fractions[0])>, std::decay_t<decltype(m[0])>>;
         
         Eigen::ArrayX<TTYPE> d(N);
-        TRHOType m2_epsilon_sigma3_bar = 0.0;
-        TRHOType m2_epsilon2_sigma3_bar = 0.0;
         for (auto i = 0L; i < N; ++i) {
             d[i] = sigma_Angstrom[i]*(1.0 - 0.12 * exp(-3.0*epsilon_over_k[i]/T)); // [A]
-            for (auto j = 0; j < N; ++j) {
-                // Eq. A.5
-                auto sigma_ij = 0.5 * sigma_Angstrom[i] + 0.5 * sigma_Angstrom[j];
-                auto eij_over_k = sqrt(epsilon_over_k[i] * epsilon_over_k[j]) * (1.0 - kmat(i,j));
-                auto sigmaij3 = sigma_ij*sigma_ij*sigma_ij;
-                auto ekT = eij_over_k/T;
-                m2_epsilon_sigma3_bar += mole_fractions[i] * mole_fractions[j] * m[i] * m[j] * ekT * sigmaij3;
-                m2_epsilon2_sigma3_bar += mole_fractions[i] * mole_fractions[j] * m[i] * m[j] * (ekT*ekT) * sigmaij3;
+        }
+        TRHOType m2_epsilon_sigma3_bar = 0.0;
+        TRHOType m2_epsilon2_sigma3_bar = 0.0;
+        if (sigmaij_rule == teqp::saft::polar_terms::SigmaijRule::geometric) {
+            // Collapsed form (Marshall): with sigma_ij = sqrt(sigma_i*sigma_j),
+            // sigma_ij^3 = sigma_i^{3/2} sigma_j^{3/2} separates over i and j,
+            // so the BIP-free part of each accumulator reduces to a perfect
+            // square of a single O(N) sum. The BIP correction terms are
+            // genuinely O(N^2), but they iterate only over nonzero kij in
+            // practice (fast when kij == 0).
+            //
+            // Define per-component scalars:
+            //   u_i = x_i m_i sqrt(eps_i / T) sigma_i^{3/2}
+            //   v_i = x_i m_i (eps_i / T)     sigma_i^{3/2}
+            // Then (BIP-free):
+            //   m2_eps_sig3   = (sum u_i)^2
+            //   m2_eps2_sig3  = (sum v_i)^2
+            // With BIPs, expanding (1-k)^p:
+            //   m2_eps_sig3   = (sum u_i)^2 - sum_ij u_i u_j k_ij
+            //   m2_eps2_sig3  = (sum v_i)^2 - 2 sum_ij v_i v_j k_ij
+            //                                 + sum_ij v_i v_j k_ij^2
+            Eigen::ArrayX<TRHOType> u(N), v(N);
+            for (auto i = 0L; i < N; ++i) {
+                auto sigma_pow_3_2 = sigma_Angstrom[i] * sqrt(sigma_Angstrom[i]);
+                auto ekT_i = epsilon_over_k[i] / T;
+                auto common = mole_fractions[i] * m[i] * sigma_pow_3_2;
+                u[i] = common * sqrt(ekT_i);
+                v[i] = common * ekT_i;
+            }
+            TRHOType U = u.sum();
+            TRHOType V = v.sum();
+            m2_epsilon_sigma3_bar = U * U;
+            m2_epsilon2_sigma3_bar = V * V;
+            // BIP correction (only nonzero entries contribute).Iterate
+            // the full N^2 to avoid maintaining a separate sparse index;
+            // the early-skip below makes this effectively O(nnz).
+            for (auto i = 0L; i < N; ++i) {
+                for (auto j = 0L; j < N; ++j) {
+                    double k_ij = kmat(i, j);
+                    if (k_ij == 0.0) continue;
+                    auto uiuj = u[i] * u[j];
+                    auto vivj = v[i] * v[j];
+                    m2_epsilon_sigma3_bar  -= uiuj * k_ij;
+                    m2_epsilon2_sigma3_bar += vivj * (-2.0 * k_ij + k_ij * k_ij);
+                }
+            }
+        }
+        else {
+            // Stock arithmetic (Lorentz-Berthelot) path: full N^2 loop with
+            // sigma_ij = (sigma_i + sigma_j) / 2 (does not separate).
+            for (auto i = 0L; i < N; ++i) {
+                for (auto j = 0; j < N; ++j) {
+                    // Eq. A.5 of Gross-Sadowski 2001
+                    auto sigma_ij = pair_sigma(i, j);
+                    auto eij_over_k = sqrt(epsilon_over_k[i] * epsilon_over_k[j]) * (1.0 - kmat(i,j));
+                    auto sigmaij3 = sigma_ij*sigma_ij*sigma_ij;
+                    auto ekT = eij_over_k/T;
+                    m2_epsilon_sigma3_bar  += mole_fractions[i] * mole_fractions[j] * m[i] * m[j] * ekT       * sigmaij3;
+                    m2_epsilon2_sigma3_bar += mole_fractions[i] * mole_fractions[j] * m[i] * m[j] * (ekT*ekT) * sigmaij3;
+                }
             }
         }
         auto mbar = (mole_fractions.template cast<TRHOType>().array()*m.template cast<TRHOType>().array()).sum();
@@ -300,20 +367,34 @@ This is the classical Gross and Sadowski model from 2001: https://doi.org/10.102
  
 with the errors fixed as noted in a comment: https://doi.org/10.1021/acs.iecr.9b01515
 */
+/// Polar-theory selector.  Default GrossVrabec preserves the historical
+/// behavior of PCSAFTMixture; JogChapman activates the Dominik/Jog-Chapman
+/// dipolar contribution implemented in JogChapman.hpp.
+enum class PolarModel { GrossVrabec, JogChapman };
+
 class PCSAFTMixture {
 public:
     using PCSAFTDipolarContribution = teqp::saft::polar_terms::GrossVrabec::DipolarContributionGrossVrabec;
+    using PCSAFTDipolarContributionJC = teqp::saft::polar_terms::JogChapman::DipolarContributionJogChapman;
     using PCSAFTQuadrupolarContribution = teqp::saft::polar_terms::GrossVrabec::QuadrupolarContributionGross;
 protected:
     Eigen::ArrayX<double> m, ///< number of segments
         mminus1, ///< m-1
-        sigma_Angstrom, ///< 
+        sigma_Angstrom, ///<
         epsilon_over_k; ///< depth of pair potential divided by Boltzman constant
     std::vector<std::string> names, bibtex;
     Eigen::ArrayXXd kmat; ///< binary interaction parameter matrix
-    
+    PolarModel polar_model = PolarModel::GrossVrabec;
+    teqp::saft::polar_terms::SigmaijRule polar_sigmaij_rule = teqp::saft::polar_terms::SigmaijRule::arithmetic;
+    teqp::saft::polar_terms::SigmaijRule nonpolar_sigmaij_rule = teqp::saft::polar_terms::SigmaijRule::arithmetic;
+        ///< sigma_ij rule inside the non-polar dispersion double sum.
+        ///< - 'arithmetic' (default) preserves stock PC-SAFT behavior; 
+        ///< - 'geometric' is the Marshall convention. Independent of polar_sigmaij_rule because
+        ///< the two layers have different parameter calibrations.
+
     PCSAFTHardChainContribution hardchain;
-    std::optional<PCSAFTDipolarContribution> dipolar; // Can be present or not
+    std::optional<PCSAFTDipolarContribution> dipolar; // GV dipolar, can be present or not
+    std::optional<PCSAFTDipolarContributionJC> dipolar_jc; // JC dipolar, alternative to dipolar
     std::optional<PCSAFTQuadrupolarContribution> quadrupolar; // Can be present or not
 
     void check_kmat(Eigen::Index N) {
@@ -350,7 +431,7 @@ protected:
             bibtex[i] = coeff.BibTeXKey;
             i++;
         }
-        return PCSAFTHardChainContribution(m, mminus1, sigma_Angstrom, epsilon_over_k, kmat, a, b);
+        return PCSAFTHardChainContribution(m, mminus1, sigma_Angstrom, epsilon_over_k, kmat, a, b, nonpolar_sigmaij_rule);
     }
     auto extract_names(const std::vector<SAFTCoeffs> &coeffs){
         std::vector<std::string> names_;
@@ -360,6 +441,11 @@ protected:
         return names_;
     }
     auto build_dipolar(const std::vector<SAFTCoeffs> &coeffs) -> std::optional<PCSAFTDipolarContribution>{
+        // Only build the GV dipolar contribution when polar_model == GrossVrabec.
+        // For JogChapman, dipolar stays std::nullopt and dipolar_jc is built instead.
+        if (polar_model != PolarModel::GrossVrabec) {
+            return std::nullopt;
+        }
         Eigen::ArrayXd mustar2(coeffs.size()), nmu(coeffs.size());
         auto i = 0;
         for (const auto &coeff : coeffs) {
@@ -371,7 +457,29 @@ protected:
             return std::nullopt; // No dipolar contribution is present
         }
         // The dispersive and hard chain initialization has already happened at this point
-        return PCSAFTDipolarContribution(m, sigma_Angstrom, epsilon_over_k, mustar2, nmu);
+        return PCSAFTDipolarContribution(m, sigma_Angstrom, epsilon_over_k, mustar2, nmu, polar_sigmaij_rule);
+    }
+    auto build_dipolar_jc(const std::vector<SAFTCoeffs> &coeffs) -> std::optional<PCSAFTDipolarContributionJC>{
+        if (polar_model != PolarModel::JogChapman) {
+            return std::nullopt;
+        }
+        Eigen::ArrayXd mustar2(coeffs.size()), xp(coeffs.size());
+        auto i = 0;
+        for (const auto &coeff : coeffs) {
+            mustar2[i] = coeff.mustar2;
+            // If the caller supplied xp directly, prefer it; otherwise derive xp = nmu/m
+            // (the standard JC<->GV mapping; see docs/eos/polar_theory_mapping.md).
+            xp[i] = (coeff.xp > 0) ? coeff.xp
+                                   : ((coeff.m > 0 && coeff.nmu > 0) ? coeff.nmu / coeff.m : 0.0);
+            i++;
+        }
+        if ((mustar2 * xp).cwiseAbs().sum() == 0) {
+            return std::nullopt; // No dipolar contribution is present
+        }
+        // JC's dipolar branch hard-codes geometric d_ij internally; the
+        // polar_sigmaij_rule on this class only affects the GV-derived
+        // quadrupolar and cross-DQ branches reachable through `quadrupolar`.
+        return PCSAFTDipolarContributionJC(m, sigma_Angstrom, epsilon_over_k, mustar2, xp);
     }
     auto build_quadrupolar(const std::vector<SAFTCoeffs> &coeffs) -> std::optional<PCSAFTQuadrupolarContribution>{
         // The dispersive and hard chain initialization has already happened at this point
@@ -385,17 +493,48 @@ protected:
         if ((Qstar2*nQ).cwiseAbs().sum() == 0){
             return std::nullopt; // No quadrupolar contribution is present
         }
-        return PCSAFTQuadrupolarContribution(m, sigma_Angstrom, epsilon_over_k, Qstar2, nQ);
+        return PCSAFTQuadrupolarContribution(m, sigma_Angstrom, epsilon_over_k, Qstar2, nQ, polar_sigmaij_rule);
+    }
+    /// Pick the polar sigma_ij combining rule when the caller did not pin
+    /// it explicitly: JogChapman defaults to geometric (its dipolar branch
+    /// is hard-coded geometric anyway, and the GV quadrupolar/cross-DQ
+    /// pieces match for internal consistency); GrossVrabec defaults to
+    /// arithmetic (Lorentz-Berthelot, the historical behavior).
+    static teqp::saft::polar_terms::SigmaijRule resolve_polar_sigmaij_rule(
+        PolarModel pm,
+        std::optional<teqp::saft::polar_terms::SigmaijRule> override_rule)
+    {
+        if (override_rule.has_value()) {
+            return override_rule.value();
+        }
+        return (pm == PolarModel::JogChapman)
+            ? teqp::saft::polar_terms::SigmaijRule::geometric
+            : teqp::saft::polar_terms::SigmaijRule::arithmetic;
     }
 public:
-    PCSAFTMixture(const std::vector<std::string> &names, 
+    PCSAFTMixture(const std::vector<std::string> &names,
                   const Eigen::Array<double, 3, 7>& a = teqp::saft::PCSAFT::PCSAFTMatrices::GrossSadowski2001::a,
                   const Eigen::Array<double, 3, 7>& b = teqp::saft::PCSAFT::PCSAFTMatrices::GrossSadowski2001::b,
-                  const Eigen::ArrayXXd& kmat = {}) : PCSAFTMixture(get_coeffs_from_names(names), a, b, kmat){};
-    PCSAFTMixture(const std::vector<SAFTCoeffs> &coeffs, 
+                  const Eigen::ArrayXXd& kmat = {},
+                  PolarModel polar_model = PolarModel::GrossVrabec,
+                  std::optional<teqp::saft::polar_terms::SigmaijRule> polar_sigmaij_rule = std::nullopt,
+                  teqp::saft::polar_terms::SigmaijRule nonpolar_sigmaij_rule = teqp::saft::polar_terms::SigmaijRule::arithmetic)
+        : PCSAFTMixture(get_coeffs_from_names(names), a, b, kmat, polar_model, polar_sigmaij_rule, nonpolar_sigmaij_rule){};
+    PCSAFTMixture(const std::vector<SAFTCoeffs> &coeffs,
                   const Eigen::Array<double, 3, 7>& a = teqp::saft::PCSAFT::PCSAFTMatrices::GrossSadowski2001::a,
                   const Eigen::Array<double, 3, 7>& b = teqp::saft::PCSAFT::PCSAFTMatrices::GrossSadowski2001::b,
-                  const Eigen::ArrayXXd &kmat = {}) : names(extract_names(coeffs)), kmat(kmat), hardchain(build_hardchain(coeffs, a, b)), dipolar(build_dipolar(coeffs)), quadrupolar(build_quadrupolar(coeffs)) {};
+                  const Eigen::ArrayXXd &kmat = {},
+                  PolarModel polar_model = PolarModel::GrossVrabec,
+                  std::optional<teqp::saft::polar_terms::SigmaijRule> polar_sigmaij_rule = std::nullopt,
+                  teqp::saft::polar_terms::SigmaijRule nonpolar_sigmaij_rule = teqp::saft::polar_terms::SigmaijRule::arithmetic)
+        : names(extract_names(coeffs)), kmat(kmat),
+          polar_model(polar_model),
+          polar_sigmaij_rule(resolve_polar_sigmaij_rule(polar_model, polar_sigmaij_rule)),
+          nonpolar_sigmaij_rule(nonpolar_sigmaij_rule),
+          hardchain(build_hardchain(coeffs, a, b)),
+          dipolar(build_dipolar(coeffs)),
+          dipolar_jc(build_dipolar_jc(coeffs)),
+          quadrupolar(build_quadrupolar(coeffs)) {};
     
 //    PCSAFTMixture( const PCSAFTMixture& ) = delete; // non construction-copyable
     PCSAFTMixture& operator=( const PCSAFTMixture& ) = delete; // non copyable
@@ -437,9 +576,14 @@ public:
         auto alphar = forceeval(vals.alphar_hc + vals.alphar_disp);
         
         auto rho_A3 = forceeval(rhomolar*N_A*1e-30);
-        // If dipole is present, add its contribution
+        // GV dipolar (active when polar_model == GrossVrabec)
         if (dipolar){
             auto valsdip = dipolar.value().eval(T, rho_A3, vals.eta, mole_fractions);
+            alphar += valsdip.alpha;
+        }
+        // JC dipolar (active when polar_model == JogChapman); mutually exclusive with `dipolar`.
+        if (dipolar_jc){
+            auto valsdip = dipolar_jc.value().eval(T, rho_A3, vals.eta, mole_fractions);
             alphar += valsdip.alpha;
         }
         // If quadrupole is present, add its contribution
@@ -476,15 +620,68 @@ inline auto PCSAFTfactory(const nlohmann::json& spec) {
         }
     }
     
+    // Optional polar-model selector. Defaults to "GrossVrabec" for backward
+    // compatibility. Set "JogChapman" to activate the Dominik/Jog-Chapman
+    // dipolar contribution implemented in JogChapman.hpp.
+    PolarModel polar_model = PolarModel::GrossVrabec;
+    if (spec.contains("polar_model")) {
+        std::string pm = spec.at("polar_model");
+        if (pm == "GrossVrabec" || pm == "gross-vrabec" || pm == "GV") {
+            polar_model = PolarModel::GrossVrabec;
+        } else if (pm == "JogChapman" || pm == "jog-chapman" || pm == "JC") {
+            polar_model = PolarModel::JogChapman;
+        } else {
+            throw teqp::InvalidArgument("Don't know what to do with polar_model = " + pm
+                + " (expected 'GrossVrabec' or 'JogChapman')");
+        }
+    }
+
+    // Optional polar sigma_ij combining-rule selector. When omitted, the
+    // PCSAFTMixture constructor picks: arithmetic for GV (Lorentz-Berthelot,
+    // historical behavior) and geometric for JC (matches JC dipolar's
+    // hard-coded geometric d_ij so the polar branches are internally
+    // consistent). Set explicitly to override.
+    std::optional<teqp::saft::polar_terms::SigmaijRule> polar_sigmaij_rule = std::nullopt;
+    if (spec.contains("polar_combining_rule")) {
+        std::string rule = spec.at("polar_combining_rule");
+        if (rule == "arithmetic" || rule == "Lorentz-Berthelot" || rule == "LB") {
+            polar_sigmaij_rule = teqp::saft::polar_terms::SigmaijRule::arithmetic;
+        } else if (rule == "geometric" || rule == "Marshall") {
+            polar_sigmaij_rule = teqp::saft::polar_terms::SigmaijRule::geometric;
+        } else {
+            throw teqp::InvalidArgument("Don't know what to do with polar_combining_rule = " + rule
+                + " (expected 'arithmetic' or 'geometric')");
+        }
+    }
+
+    // Optional nonpolar sigma_ij combining-rule selector for the dispersion
+    // double sum in PCSAFTHardChainContribution.
+    teqp::saft::polar_terms::SigmaijRule nonpolar_sigmaij_rule = teqp::saft::polar_terms::SigmaijRule::arithmetic;
+    if (spec.contains("nonpolar_combining_rule")) {
+        std::string rule = spec.at("nonpolar_combining_rule");
+        if (rule == "arithmetic" || rule == "Lorentz-Berthelot" || rule == "LB") {
+            nonpolar_sigmaij_rule = teqp::saft::polar_terms::SigmaijRule::arithmetic;
+        } else if (rule == "geometric" || rule == "Marshall") {
+            nonpolar_sigmaij_rule = teqp::saft::polar_terms::SigmaijRule::geometric;
+        } else {
+            throw teqp::InvalidArgument("Don't know what to do with nonpolar_combining_rule = " + rule
+                + " (expected 'arithmetic' or 'geometric')");
+        }
+    }
+
     if (spec.contains("names")){
         std::vector<std::string> names = spec["names"];
         if (kmat && static_cast<std::size_t>(kmat.value().rows()) != names.size()){
             throw teqp::InvalidArgument("Provided length of names of " + std::to_string(names.size()) + " does not match the dimension of the kmat of " + std::to_string(kmat.value().rows()));
         }
-        return PCSAFTMixture(names, a, b, kmat.value_or(Eigen::ArrayXXd{}));
+        return PCSAFTMixture(names, a, b, kmat.value_or(Eigen::ArrayXXd{}), polar_model, polar_sigmaij_rule, nonpolar_sigmaij_rule);
     }
     else if (spec.contains("coeffs")){
         std::vector<SAFTCoeffs> coeffs;
+        // Debye to C*m conversion: 1 D = 3.33564e-30 C*m (SI).
+        // Used to fold Marshall's lumped alpha_p [D^2] into teqp's
+        // dimensionless (mu*)^2.
+        constexpr double DEBYE_TO_CM = 3.33564e-30;
         for (auto j : spec["coeffs"]) {
             SAFTCoeffs c;
             c.name = j.at("name");
@@ -496,6 +693,52 @@ inline auto PCSAFTfactory(const nlohmann::json& spec) {
                 c.mustar2 = j.at("(mu^*)^2");
                 c.nmu = j.at("nmu");
             }
+            // JC's xp (fraction of polar segments) overrides nmu/m if both are present.
+            if (j.contains("xp")) {
+                c.xp = j.at("xp");
+                // If only xp + (mu^*)^2 were supplied (no nmu), still want mustar2 picked up.
+                if (j.contains("(mu^*)^2") && !j.contains("nmu")) {
+                    c.mustar2 = j.at("(mu^*)^2");
+                }
+            }
+            // Marshall ``alpha_p`` shorthand: lumped polar strength in [D^2].
+            // Fold to dimensionless ``(mu*)^2`` via the JC<->GV invariant
+            //   n_mu * mu_GV^2 = m * alpha_p,  i.e.,
+            //   mu_eff^2 [D^2] = m * alpha_p / n_mu = alpha_p / xp.
+            // Then convert to teqp's reduced form:
+            //   (mu*)^2 = mu_eff^2 / (4*pi*eps0 * m * eps_k * k_B * sigma_m^3).
+            // Only consumed when the user did NOT already provide (mu^*)^2.
+            if (j.contains("alpha_p") && !j.contains("(mu^*)^2")) {
+                double alpha_p_D2 = j.at("alpha_p");
+                if (alpha_p_D2 > 0) {
+                    // Pick n_mu: prefer explicit ``nmu``, else derive from xp*m,
+                    // else fall back to m (i.e., assume every segment polar).
+                    double n_mu_local;
+                    if (j.contains("nmu")) {
+                        n_mu_local = j.at("nmu");
+                        c.nmu = n_mu_local;
+                    } else if (j.contains("xp")) {
+                        n_mu_local = c.m * static_cast<double>(j.at("xp"));
+                        c.nmu = n_mu_local;
+                    } else {
+                        n_mu_local = c.m;
+                        c.nmu = n_mu_local;
+                    }
+                    if (n_mu_local > 0) {
+                        double mu_eff_D2 = c.m * alpha_p_D2 / n_mu_local;
+                        double mu_eff_Cm2 = mu_eff_D2 * DEBYE_TO_CM * DEBYE_TO_CM;
+                        double sigma_m = c.sigma_Angstrom * 1e-10;
+                        double denom = 4.0 * static_cast<double>(EIGEN_PI)
+                                       * teqp::constants::epsilon_0
+                                       * c.m * c.epsilon_over_k
+                                       * teqp::constants::k_B
+                                       * sigma_m * sigma_m * sigma_m;
+                        if (denom > 0) {
+                            c.mustar2 = mu_eff_Cm2 / denom;
+                        }
+                    }
+                }
+            }
             if (j.contains("(Q^*)^2") && j.contains("nQ")){
                 c.Qstar2 = j.at("(Q^*)^2");
                 c.nQ = j.at("nQ");
@@ -505,7 +748,7 @@ inline auto PCSAFTfactory(const nlohmann::json& spec) {
         if (kmat && static_cast<std::size_t>(kmat.value().rows()) != coeffs.size()){
             throw teqp::InvalidArgument("Provided length of coeffs of " + std::to_string(coeffs.size()) + " does not match the dimension of the kmat of " + std::to_string(kmat.value().rows()));
         }
-        return PCSAFTMixture(coeffs, a, b, kmat.value_or(Eigen::ArrayXXd{}));
+        return PCSAFTMixture(coeffs, a, b, kmat.value_or(Eigen::ArrayXXd{}), polar_model, polar_sigmaij_rule, nonpolar_sigmaij_rule);
     }
     else{
         throw std::invalid_argument("you must provide names or coeffs, but not both");

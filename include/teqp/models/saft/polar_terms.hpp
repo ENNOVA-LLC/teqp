@@ -7,16 +7,28 @@
  non-polar base models as well, so this header collects all the things in one place
  */
 
+#include "nlohmann/json.hpp"
 #include "teqp/types.hpp"
 #include "teqp/constants.hpp"
 #include "teqp/exceptions.hpp"
 #include "correlation_integrals.hpp"
 #include <optional>
-#include <Eigen/Dense>  
+#include <Eigen/Dense>
 #include "teqp/math/pow_templates.hpp"
 #include "teqp/models/saft/polar_terms/GrossVrabec.hpp"
+#include "teqp/models/saft/polar_terms/JogChapman.hpp"
 #include "teqp/models/saft/polar_terms/types.hpp"
 #include <variant>
+
+// JSON serialization for the polar-term enums.  These live here (not in
+// types.hpp) so that types.hpp can remain a pure header without a
+// dependency on nlohmann/json's include path being configured.  See
+// the note at the top of types.hpp.
+NLOHMANN_JSON_SERIALIZE_ENUM( teqp::saft::polar_terms::multipolar_rhostar_approach, {
+    {teqp::saft::polar_terms::multipolar_rhostar_approach::kInvalid, nullptr},
+    {teqp::saft::polar_terms::multipolar_rhostar_approach::use_packing_fraction, "use_packing_fraction"},
+    {teqp::saft::polar_terms::multipolar_rhostar_approach::calculate_Gubbins_rhostar, "calculate_Gubbins_rhostar"},
+})
 
 namespace teqp{
 
@@ -686,6 +698,7 @@ public:
 /// The variant containing the multipolar types that can be provided
 using multipolar_contributions_variant = std::variant<
     teqp::saft::polar_terms::GrossVrabec::MultipolarContributionGrossVrabec,
+    teqp::saft::polar_terms::JogChapman::MultipolarContributionJogChapman,
     MultipolarContributionGrayGubbins<GubbinsTwuJIntegral, GubbinsTwuKIntegral>,
     MultipolarContributionGrayGubbins<GottschalkJIntegral, GottschalkKIntegral>,
     MultipolarContributionGrayGubbins<LuckasJIntegral, LuckasKIntegral>,

@@ -137,6 +137,16 @@ if ((NOT TEQP_NO_TESTS) AND PROJECT_IS_TOP_LEVEL)
   add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/externals/Catch2")
 endif()
 
+# Define a nlohmann_json interface target *before* pulling in the
+# json-schema-validator subdirectory.
+if (NOT TARGET nlohmann_json)
+  add_library(nlohmann_json INTERFACE)
+  target_include_directories(nlohmann_json INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/externals/nlohmann_json")
+endif()
+# The json-schema-validator submodule links against the namespaced alias.
+if (NOT TARGET nlohmann_json::nlohmann_json)
+  add_library(nlohmann_json::nlohmann_json ALIAS nlohmann_json)
+endif()
 add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/externals/json-schema-validator")
 set_property(TARGET nlohmann_json_schema_validator PROPERTY POSITION_INDEPENDENT_CODE ON)
 
