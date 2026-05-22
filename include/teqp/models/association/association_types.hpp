@@ -17,20 +17,33 @@ inline auto get_association_classes(const std::string& s) {
     }
 }
 
-enum class radial_dists { CS, KG };
+enum class radial_dists {
+    CS,     ///< Carnahan-Starling at mixture eta built from T-independent sigma; cheap, used by CPA-style models.
+    KG,     ///< Kontogeorgis form g = 1 / (1 - 1.9 eta); also from sigma.
+    BMCSL,  ///< Boublik-Mansoori-Carnahan-Starling-Leland pair-specific g_ij(d_i(T), d_j(T)); the Gross-Sadowski 2002 PC-SAFT-association choice and feos's choice. Requires per-species (m, sigma, epsilon/k) in the CanonicalData.
+};
 
 inline auto get_radial_dist(const std::string& s) {
     if (s == "CS") { return radial_dists::CS; }
     else if (s == "KG") { return radial_dists::KG; }
+    else if (s == "BMCSL") { return radial_dists::BMCSL; }
     else {
         throw std::invalid_argument("bad radial_dist flag: " + s);
     }
 }
 
-enum class Delta_rules {not_set, CR1, Dufal};
+enum class Delta_rules {
+    not_set,
+    CR1,        ///< Wertheim CR1: arithmetic-mean b (==> arithmetic-mean m*sigma^3), geometric-mean beta, arithmetic-mean epsilon. teqp's historical convention.
+    CR1_WS,     ///< CR1 with the Wolbach-Sandler 1998 cross-association combining rule:
+                ///<   kappa_ij = sqrt(kappa_i * kappa_j),
+                ///<   sigma_ij^3 = (sigma_i * sigma_j)^(3/2),  i.e. geometric mean of sigma^3 not arithmetic mean of m*sigma^3.
+    Dufal,
+};
 
 inline auto get_Delta_rule(const std::string& s) {
     if (s == "CR1") { return Delta_rules::CR1; }
+    else if (s == "CR1-WS" || s == "CR1_WS") { return Delta_rules::CR1_WS; }
     else if (s == "Dufal") { return Delta_rules::Dufal; }
     else {
         throw std::invalid_argument("bad Delta_rule flag: " + s);
@@ -42,6 +55,13 @@ struct CanonicalData{
         beta, ///< The volume factor, dimensionless, one per component
         epsilon_Jmol; ///< The association energy of each molecule, in J/mol, one per component
     radial_dists radial_dist;
+
+    // Per-species PC-SAFT segment parameters. Required when
+    // ``radial_dist == BMCSL`` so the Delta routine can build d_i(T) and the
+    // BMCSL pair g_ij(d_i, d_j).
+    Eigen::ArrayXd m_segments;          ///< Chain length m_i [-]
+    Eigen::ArrayXd sigma_m;             ///< Segment diameter sigma_i [m]
+    Eigen::ArrayXd epsilon_over_k_K;    ///< Segment energy parameter eps_i/k_B [K]
 };
 
 struct DufalData{

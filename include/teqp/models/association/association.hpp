@@ -28,7 +28,7 @@ namespace association{
 struct AssociationOptions{
     std::map<std::string, std::vector<std::string>> interaction_partners;
     std::vector<std::string> site_order;
-    association::radial_dists radial_dist;
+    association::radial_dists radial_dist = association::radial_dists::CS;
     association::Delta_rules Delta_rule = association::Delta_rules::CR1;
     std::vector<bool> self_association_mask;
     bool allow_explicit_fractions=true;
@@ -41,6 +41,9 @@ inline void from_json(const nlohmann::json& j, AssociationOptions& o) {
     if (j.contains("rtol")){ j.at("rtol").get_to(o.rtol); }
     if (j.contains("atol")){ j.at("atol").get_to(o.atol); }
     if (j.contains("max_iters")){ j.at("max_iters").get_to(o.max_iters); }
+    if (j.contains("radial_dist")){
+        o.radial_dist = association::get_radial_dist(j.at("radial_dist").get<std::string>());
+    }
 }
 
 
@@ -224,14 +227,39 @@ public:
         
         if (j.contains("Delta_rule")){
             std::string Delta_rule = j.at("Delta_rule");
-            if (Delta_rule == "CR1"){
+            if (Delta_rule == "CR1" || Delta_rule == "CR1-WS" || Delta_rule == "CR1_WS"){
                 CanonicalData data;
                 data.b_m3mol = toEig(j, "b / m^3/mol");
                 data.beta = toEig(j, "beta");
                 data.epsilon_Jmol = toEig(j, "epsilon / J/mol");
                 auto options =  get_association_options(j);
-                options.Delta_rule = Delta_rules::CR1;
+                const bool is_WS = (Delta_rule == "CR1-WS" || Delta_rule == "CR1_WS");
+                options.Delta_rule = is_WS ? Delta_rules::CR1_WS : Delta_rules::CR1;
                 data.radial_dist = options.radial_dist;
+                // BMCSL needs per-species segment parameters (m, sigma, eps/k)
+                // so the Delta routine can build d_i(T) and the pair g_ij.
+                // CR1-WS also needs sigma_m for the geometric sigma^3 cross-term.
+                // (These are optional for CR1 + CS / KG which only use ``b`` and ``beta``.)
+                const bool need_segment_params = (data.radial_dist == radial_dists::BMCSL) || is_WS;
+                if (need_segment_params){
+                    if (!(j.contains("m") && j.contains("sigma / m")
+                          && (j.contains("epsilon/kB / K") || j.contains("epsilon / J/mol_segment")))){
+                        throw teqp::InvalidArgument(
+                            "Delta_rule=CR1-WS or radial_dist=BMCSL requires the association block "
+                            "to carry per-species 'm', 'sigma / m', and 'epsilon/kB / K' arrays "
+                            "(same definition as PC-SAFT segment parameters) so the BMCSL g_ij "
+                            "can build d_i(T) and the WS cross-association can build sigma_ij^3."
+                        );
+                    }
+                    data.m_segments = toEig(j, "m");
+                    data.sigma_m = toEig(j, "sigma / m");
+                    if (j.contains("epsilon/kB / K")){
+                        data.epsilon_over_k_K = toEig(j, "epsilon/kB / K");
+                    }
+                    else {
+                        data.epsilon_over_k_K = toEig(j, "epsilon / J/mol_segment") / constants::R_CODATA2017;
+                    }
+                }
                 options.interaction_partners = get_interaction_partners(j);
                 return {data, j.at("molecule_sites"), options};
             }
@@ -280,16 +308,58 @@ public:
         
         // Calculate the radial_dist if it is meaningful
         using eta_t = std::common_type_t<decltype(rhomolar), decltype(molefracs[0])>; // Type promotion, without the const-ness
-        std::optional<eta_t> g;
-        if (m_Delta_rule == Delta_rules::CR1){
+        std::optional<eta_t> g;     // Single mixture-averaged g (CS, KG)
+        // BMCSL inputs: pair-specific g_ij needs ``d_i(T)`` per component and
+        // the n_2 / n_3 HS moments. They mix T-dependent ``d_i`` with the
+        // rho * x product, so use a triple-promoted scalar type.
+        using d_t = std::common_type_t<decltype(T), decltype(molefracs[0])>;
+        using bmcsl_t = std::common_type_t<decltype(T), decltype(rhomolar), decltype(molefracs[0])>;
+        std::optional<Eigen::Array<d_t, Eigen::Dynamic, 1>> d_T;
+        std::optional<bmcsl_t> n2_BMCSL;
+        std::optional<bmcsl_t> n3_BMCSL;
+        // CR1 and CR1-WS share the same radial-distribution setup; they only
+        // differ in the strength-formula combining rule inside the inner (I,J) loop below.
+        if (m_Delta_rule == Delta_rules::CR1 || m_Delta_rule == Delta_rules::CR1_WS){
             const CanonicalData& d = std::get<CanonicalData>(datasidecar);
-            auto bmix = (molefracs*d.b_m3mol).sum();
-            auto eta = bmix*rhomolar/4.0;
             switch(d.radial_dist){
-                case radial_dists::CS:
-                    g = (2.0-eta)/(2.0*(1.0-eta)*(1.0-eta)*(1.0-eta)); break;
-                case radial_dists::KG:
-                    g = 1.0 / (1.0 - 1.9*eta); break;
+                case radial_dists::CS: {
+                    auto bmix = (molefracs*d.b_m3mol).sum();
+                    auto eta = bmix*rhomolar/4.0;
+                    g = (2.0-eta)/(2.0*(1.0-eta)*(1.0-eta)*(1.0-eta));
+                    break;
+                }
+                case radial_dists::KG: {
+                    auto bmix = (molefracs*d.b_m3mol).sum();
+                    auto eta = bmix*rhomolar/4.0;
+                    g = 1.0 / (1.0 - 1.9*eta);
+                    break;
+                }
+                case radial_dists::BMCSL: {
+                    // Sanity: BMCSL requires the segment-parameter arrays
+                    // (m, sigma, eps/k) on CanonicalData. Verified once at
+                    // construction in ``association_factory_args_canonical``;
+                    // here we trust the construction-time check.
+                    using namespace teqp::constants;
+                    const auto N = molefracs.size();
+                    Eigen::Array<d_t, Eigen::Dynamic, 1> d_arr(N);
+                    bmcsl_t n2 = 0.0, n3 = 0.0;
+                    const double PI_LOCAL = EIGEN_PI;
+                    for (auto i = 0; i < N; ++i){
+                        // Barker-Henderson temperature-dependent segment diameter [m]
+                        d_arr[i] = d.sigma_m[i] * (1.0 - 0.12*exp(-3.0*d.epsilon_over_k_K[i]/T));
+                        // Number density of segments of species i:
+                        //   rho_seg_i = rhomolar * x_i * N_A * m_i
+                        auto rho_seg_i = rhomolar * molefracs[i] * N_A * d.m_segments[i];
+                        auto d2 = d_arr[i]*d_arr[i];
+                        auto d3 = d2*d_arr[i];
+                        n2 = n2 + rho_seg_i * PI_LOCAL * d2;
+                        n3 = n3 + rho_seg_i * (PI_LOCAL/6.0) * d3;
+                    }
+                    d_T = std::move(d_arr);
+                    n2_BMCSL = n2;
+                    n3_BMCSL = n3;
+                    break;
+                }
                 default:
                     throw std::invalid_argument("Bad radial distribution");
             }
@@ -343,13 +413,53 @@ public:
                 
                 using namespace teqp::constants;
                 
-                if (m_Delta_rule == Delta_rules::CR1){
-                    // The CR1 rule is used to calculate the cross contributions
+                if (m_Delta_rule == Delta_rules::CR1 || m_Delta_rule == Delta_rules::CR1_WS){
+                    // The CR1 / CR1-WS rules differ only in how the volume
+                    // factor (b * beta) of the cross-association term is
+                    // built. The radial-distribution function and the
+                    // Boltzmann factor exp(eps_ij / RT) are identical.
                     const CanonicalData& d = std::get<CanonicalData>(datasidecar);
-                    auto b_ij = (d.b_m3mol[i] + d.b_m3mol[j])/2.0;
                     auto epsilon_ij_Jmol = (d.epsilon_Jmol[i] + d.epsilon_Jmol[j])/2.0;
+
+                    // Strength volume:
+                    //   CR1:    b_ij * beta_ij   with b_ij  = (b_i + b_j)/2
+                    //                                  beta_ij = sqrt(beta_i * beta_j)
+                    //   CR1-WS: kappa_ij * (sigma_i*sigma_j)^(3/2) * N_A
+                    //           with kappa_ij = sqrt(kappa_i * kappa_j) (== beta_ij)
+                    //           and the geometric sigma^3 cross term.
+                    using namespace teqp::constants;
                     auto beta_ij = sqrt(d.beta[i]*d.beta[j]);
-                    Delta(I, J) = g.value()*b_ij*beta_ij*(exp(epsilon_ij_Jmol/(R_CODATA2017*T))-1.0)/N_A; // m^3
+                    decltype(beta_ij) strength_vol;
+                    if (m_Delta_rule == Delta_rules::CR1_WS){
+                        // (sigma_i sigma_j)^(3/2) = sqrt(sigma_i^3 * sigma_j^3)
+                        auto sigi3 = d.sigma_m[i]*d.sigma_m[i]*d.sigma_m[i];
+                        auto sigj3 = d.sigma_m[j]*d.sigma_m[j]*d.sigma_m[j];
+                        auto sigma_ij3 = sqrt(sigi3*sigj3);
+                        strength_vol = beta_ij*sigma_ij3*N_A;
+                    }
+                    else {
+                        auto b_ij = (d.b_m3mol[i] + d.b_m3mol[j])/2.0;
+                        strength_vol = b_ij*beta_ij;
+                    }
+
+                    // Pick the radial-distribution value: CS/KG share one
+                    // mixture-averaged ``g``; BMCSL is pair-specific via
+                    //   k_ij = d_i d_j / (d_i + d_j) * n_2 / (1 - n_3)
+                    //   g_ij = 1/(1-n_3) * (1 + k_ij/2 + k_ij^2/18)
+                    auto boltzmann_factor = exp(epsilon_ij_Jmol/(R_CODATA2017*T)) - 1.0;
+                    if (d.radial_dist == radial_dists::BMCSL){
+                        const auto& d_arr = d_T.value();
+                        const auto& n2 = n2_BMCSL.value();
+                        const auto& n3 = n3_BMCSL.value();
+                        auto inv_1mn3 = 1.0 / (1.0 - n3);
+                        auto d_i = d_arr[i], d_j = d_arr[j];
+                        auto k_ij = d_i*d_j / (d_i + d_j) * n2 * inv_1mn3;
+                        auto g_ij = inv_1mn3 * (1.0 + k_ij/2.0 + k_ij*k_ij/18.0);
+                        Delta(I, J) = g_ij*strength_vol*boltzmann_factor/N_A; // m^3
+                    }
+                    else {
+                        Delta(I, J) = g.value()*strength_vol*boltzmann_factor/N_A; // m^3
+                    }
                 }
                 else if (m_Delta_rule == Delta_rules::Dufal){
                     const DufalData& d = std::get<DufalData>(datasidecar);
