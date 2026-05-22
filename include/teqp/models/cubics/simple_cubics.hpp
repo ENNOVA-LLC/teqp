@@ -15,6 +15,7 @@ Implementations of the canonical cubic equations of state
 #include "cubicsuperancillary.hpp"
 #include "teqp/json_tools.hpp"
 #include "teqp/math/pow_templates.hpp"
+#include "teqp/cpp/model_kind.hpp"
 
 #include "nlohmann/json.hpp"
 
@@ -238,7 +239,19 @@ public:
         }
         return forceeval(b_);
     }
-    
+
+    /// b_mix [m^3/mol] for the density solver. For cubics, linear-mixing covolume.
+    template<typename CompType>
+    double get_bmix(const double T, const CompType& molefracs) const {
+        return static_cast<double>(get_b(T, molefracs));
+    }
+
+    /// Coarse model-family tag; tells the density solver to use cubic-style
+    /// eta seeds (vapor seed tracks zb, no dense root in "auto").
+    teqp::cppinterface::ModelKind get_model_kind() const {
+        return teqp::cppinterface::ModelKind::Cubic;
+    }
+
     template<typename TType, typename RhoType, typename MoleFracType>
     auto alphar(const TType& T,
                 const RhoType& rho,

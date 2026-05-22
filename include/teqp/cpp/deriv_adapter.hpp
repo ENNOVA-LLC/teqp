@@ -96,6 +96,16 @@ concept CallableReducingTemperature = requires(T t, U u) {
     { t.get_reducing_temperature(u) };
 };
 
+template<typename T, typename U>
+concept CallableBmix = requires(T t, double TT, U u) {
+    { t.get_bmix(TT, u) };
+};
+
+template<typename T>
+concept CallableModelKind = requires(T t) {
+    { t.get_model_kind() } -> std::convertible_to<teqp::cppinterface::ModelKind>;
+};
+
 /**
  This class holds a const reference to a class, and exposes an interface that matches that used in AbstractModel
  
@@ -117,7 +127,17 @@ public:
     const std::type_index& get_type_index() const override {
         return mp.index;
     };
-    
+
+    virtual teqp::cppinterface::ModelKind get_model_kind() const override {
+        using Model = std::decay_t<decltype(mp.get_cref())>;
+        if constexpr (CallableModelKind<Model>) {
+            return mp.get_cref().get_model_kind();
+        }
+        else {
+            return teqp::cppinterface::ModelKind::Other;
+        }
+    }
+
 //    template<typename T>
 //    DerivativeAdapter(const Owner<T>&& mp): mp(mp) {} ;
 //
@@ -170,6 +190,16 @@ public:
         return rho*rho*rho*static_cast<double>(centered_diff<3,4>(f, static_cast<my_float_t>(rho), 1e-16*static_cast<my_float_t>(rho)));
     }
     
+    virtual double get_bmix(const double T, const REArrayd& molefrac) const override {
+        using Model = std::decay_t<decltype(mp.get_cref())>;
+        if constexpr(CallableBmix<Model, EArrayd>){
+            return mp.get_cref().get_bmix(T, molefrac.eval());
+        }
+        else{
+            throw teqp::NotImplementedError("Cannot call get_bmix of a class that doesn't define it");
+        }
+    }
+
     virtual double get_reducing_density(const EArrayd& molefrac) const  override {
         using Model = std::decay_t<decltype(mp.get_cref())>;
         if constexpr(CallableReducingDensity<Model, EArrayd>){

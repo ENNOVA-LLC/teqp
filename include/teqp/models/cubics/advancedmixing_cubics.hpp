@@ -11,6 +11,7 @@
 #include "cubicsuperancillary.hpp"
 #include "teqp/json_tools.hpp"
 #include "teqp/math/pow_templates.hpp"
+#include "teqp/cpp/model_kind.hpp"
 
 #include "nlohmann/json.hpp"
 
@@ -201,7 +202,19 @@ public:
         }
         return forceeval(b_);
     }
-    
+
+    /// b_mix [m^3/mol] for the density solver.
+    /// Delegates to the configured b mixing rule (quadratic or linear).
+    template<typename CompType>
+    double get_bmix(const double T, const CompType& molefracs) const {
+        return static_cast<double>(get_b(T, molefracs));
+    }
+
+    /// Coarse model-family tag; cubic-style eta seeds for the density solver.
+    teqp::cppinterface::ModelKind get_model_kind() const {
+        return teqp::cppinterface::ModelKind::Cubic;
+    }
+
     template<typename TType, typename RhoType, typename MoleFracType>
     auto alphar(const TType& T,
                 const RhoType& rho,

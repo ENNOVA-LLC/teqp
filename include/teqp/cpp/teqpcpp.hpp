@@ -1,7 +1,9 @@
-#pragma once 
+#pragma once
 #include <memory>
 #include <typeindex>
 #include <optional>
+#include <string>
+#include <vector>
 
 #include <Eigen/Dense>
 #include "nlohmann/json.hpp"
@@ -11,6 +13,7 @@
 #include "teqp/algorithms/critical_tracing_types.hpp"
 #include "teqp/algorithms/VLE_types.hpp"
 #include "teqp/algorithms/VLLE_types.hpp"
+#include "teqp/cpp/model_kind.hpp"
 
 using EArray2 = Eigen::Array<double, 2, 1>;
 using EArrayd = Eigen::ArrayX<double>;
@@ -97,7 +100,14 @@ namespace teqp {
             virtual ~AbstractModel() = default;
             
             virtual const std::type_index& get_type_index() const = 0;
-            
+
+            /**
+             * \brief Coarse model-family classifier; see ``ModelKind``. Defaults
+             *        to ``Other`` for concrete models that do not opt in by
+             *        defining ``get_model_kind`` themselves.
+             */
+            virtual ModelKind get_model_kind() const = 0;
+
             virtual double get_R(const EArrayd&) const = 0;
             double R(const EArrayd& x) const { return get_R(x); };
             
@@ -166,6 +176,83 @@ namespace teqp {
             
             EArray2 pure_VLE_T(const double T, const double rhoL, const double rhoV, int maxiter, const std::optional<Eigen::ArrayXd>& molefracs = std::nullopt) const;
             double dpsatdT_pure(const double T, const double rhoL, const double rhoV) const;
+
+            /**
+             * \brief Mixture covolume / hard-chain volume [m^3/mol], the scale
+             *        used to non-dimensionalize the volume root in solve_density.
+             *
+             * Each model owns its own volume scale:
+             *  - Cubics (vdW, SRK, PR): b_mix = sum_i x_i b_i (or the model's mixing rule)
+             *  - PC-SAFT: b_mix = (pi/6) * N_A * sum_i x_i m_i d_i^3 with BH d_i(T)
+             *  - Multifluid: not defined (throws NotImplementedError)
+             *
+             * Hiding this from the caller means Python code never needs to mirror
+             * the EOS's volume math.
+             */
+            virtual double get_bmix(const double T, const REArrayd& molefracs) const = 0;
+
+            /**
+             * \brief Solve for the thermodynamically stable molar density at
+             *        (T, P, molefracs) by Newton-on-eta with bisection safeguard,
+             *        then Gibbs-energy ranking across all converged roots.
+             *
+             * This is the common-case entry point: it returns a single density,
+             * the one with lowest reduced Gibbs energy. For diagnostic access to
+             * every converged root (phase-stability inspection, sweeps), use
+             * ``solve_density_roots`` instead.
+             *
+             * Internally queries ``model.get_bmix(T, x)`` for the volume scale
+             * and ``model.get_model_kind()`` to pick family-appropriate eta
+             * seeds (cubics skip the dense root and start vapor near zb; SAFT
+             * includes a dense seed at eta=0.95).
+             *
+             * \param T temperature [K]
+             * \param P pressure [Pa]
+             * \param molefracs composition
+             * \param mode one of "auto", "vapor", "liquid", "liquid+", "dense"
+             * \return stable molar density [mol/m^3]; NaN if no root converged
+             */
+            double solve_density(
+                const double T, const double P, const REArrayd& molefracs,
+                const std::string& mode
+            ) const;
+
+            /**
+             * \brief Diagnostic variant: returns every converged root, deduplicated
+             *        and in ascending order of discovery. Caller is responsible
+             *        for ranking / selecting among them.
+             *
+             * Use this when the full root structure matters (phase stability,
+             * spinodal proximity, multi-root sweeps). For typical "return stable rho
+             * at (T, P, x)" usage call ``solve_density`` instead.
+             *
+             * \return vector of converged densities [mol/m^3]; empty if all seeds failed
+             */
+            std::vector<double> solve_density_roots(
+                const double T, const double P, const REArrayd& molefracs,
+                const std::string& mode
+            ) const;
+
+            /**
+             * \brief Warm-start density solve from a user-supplied density guess
+             *        (e.g., the previous outer-loop iteration's converged rho in a
+             *        TP-flash). If the single Newton from the guess fails, falls back
+             *        automatically to the multi-seed solve in ``mode`` and
+             *        picks the Gibbs-stable root.
+             *
+             * \param T temperature [K]
+             * \param P pressure [Pa]
+             * \param molefracs composition
+             * \param rho_guess warm-start density [mol/m^3]
+             * \param mode fallback mode if warm-start fails ("auto" recommended)
+             * \return stable molar density [mol/m^3]; NaN only if both warm
+             *         and fallback paths failed
+             */
+            double solve_density_from_guess(
+                const double T, const double P, const REArrayd& molefracs,
+                const double rho_guess,
+                const std::string& mode
+            ) const;
             
             virtual std::tuple<EArrayd, EArrayd> get_drhovecdp_Tsat(const double T, const REArrayd& rhovecL, const REArrayd& rhovecV) const;
             virtual std::tuple<EArrayd, EArrayd> get_drhovecdT_psat(const double T, const REArrayd& rhovecL, const REArrayd& rhovecV) const;

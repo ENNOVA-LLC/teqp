@@ -491,7 +491,17 @@ void init_teqp(py::module& m) {
     add_multifluid(m);
     add_multifluid_mutant(m);
     add_multifluid_ecs_mutant(m);
-    
+
+    // Expose ModelKind so callers can compare model.get_model_kind()
+    // against named values from Python.
+    using MK = teqp::cppinterface::ModelKind;
+    py::enum_<MK>(m, "ModelKind")
+        .value("Cubic",       MK::Cubic)
+        .value("SAFT",        MK::SAFT)
+        .value("Multifluid",  MK::Multifluid)
+        .value("IdealGas",    MK::IdealGas)
+        .value("Other",       MK::Other);
+
     using am = teqp::cppinterface::AbstractModel;
     py::class_<AbstractModel, std::unique_ptr<AbstractModel>>(m, "AbstractModel", py::dynamic_attr())
     
@@ -556,6 +566,35 @@ void init_teqp(py::module& m) {
     
         .def("pure_VLE_T", &am::pure_VLE_T, "T"_a, "rhoL"_a, "rhoV"_a, "max_iter"_a, py::arg_v("molefrac", std::nullopt, "None"))
         .def("dpsatdT_pure", &am::dpsatdT_pure, "T"_a, "rhoL"_a, "rhoV"_a)
+
+    // Routines related to single-phase density/volume solving at (T, P, x)
+        .def("get_bmix", &am::get_bmix, "T"_a, "molefrac"_a.noconvert(),
+             "Mixture covolume / hard-chain volume [m^3/mol]. "
+             "Cubics use the static covolume mixing rule; PC-SAFT uses "
+             "(pi/6) * N_A * sum x_i m_i d_i(T)^3 with Barker-Henderson d_i.")
+        .def("get_model_kind", &am::get_model_kind,
+             "Coarse model-family classifier (Cubic / SAFT / Multifluid / "
+             "IdealGas / Other). Used by the density solver to pick "
+             "family-appropriate eta seeds.")
+        .def("solve_density",
+             &am::solve_density,
+             "T"_a, "P"_a, "molefrac"_a.noconvert(),
+             "mode"_a,
+             "Solve for the thermodynamically stable molar density [mol/m^3] "
+             "at (T, P, x). Returns NaN if no root converged.")
+        .def("solve_density_roots",
+             &am::solve_density_roots,
+             "T"_a, "P"_a, "molefrac"_a.noconvert(),
+             "mode"_a,
+             "Returns every converged molar density root [mol/m^3] at (T, P, x). "
+             "Use solve_density() for the common 'give me stable rho' case.")
+        .def("solve_density_from_guess",
+             &am::solve_density_from_guess,
+             "T"_a, "P"_a, "molefrac"_a.noconvert(),
+             "rho_guess"_a, "mode"_a,
+             "Warm-start density solve [mol/m^3]: one Newton from rho_guess; "
+             "on failure, falls back internally to the multi-seed solve in 'mode' "
+             "and picks the stable root.")
     
         .def("get_drhovecdp_Tsat", &am::get_drhovecdp_Tsat, "T"_a, "rhovecL"_a.noconvert(), "rhovecV"_a.noconvert())
         .def("get_drhovecdT_psat", &am::get_drhovecdT_psat, "T"_a, "rhovecL"_a.noconvert(), "rhovecV"_a.noconvert())

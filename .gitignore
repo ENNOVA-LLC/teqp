@@ -17,3 +17,7 @@ doc/source/examples/*.pdf
 interface/CPP/model_schemas.cpp
 
 interface/CPP/model_schemas.json
+
+# Per-developer IDE settings
+.vscode/settings.json
+.vscode/c_cpp_properties.json

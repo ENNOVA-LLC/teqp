@@ -57,7 +57,27 @@ public:
     auto R(const VecType& molefrac) const {
         return get_R_gas<decltype(molefrac[0])>();
     }
-    
+
+    /// b_mix [m^3/mol] for the density solver. Association and polar layers
+    /// are attractive corrections and do not change the η-mapping, so this
+    /// delegates to the nonpolar (hard-chain) layer's get_bmix.
+    template<typename VecType>
+    double get_bmix(const double T, const VecType& molefracs) const {
+        return std::visit([&](const auto& t) -> double {
+            if constexpr (requires { t.get_bmix(T, molefracs); }) {
+                return t.get_bmix(T, molefracs);
+            } else {
+                throw teqp::NotImplementedError(
+                    "get_bmix is not implemented for this GenericSAFT nonpolar variant");
+            }
+        }, nonpolar);
+    }
+
+    /// Coarse model-family tag; GenericSAFT is a SAFT variant by construction.
+    teqp::cppinterface::ModelKind get_model_kind() const {
+        return teqp::cppinterface::ModelKind::SAFT;
+    }
+
     NonPolarTerms nonpolar;
 //    std::optional<PolarTerms> polar;
     std::optional<AssociationTerms> association;

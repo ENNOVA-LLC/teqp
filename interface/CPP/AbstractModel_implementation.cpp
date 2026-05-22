@@ -3,6 +3,7 @@
 #include "teqp/algorithms/VLE_pure.hpp"
 #include "teqp/algorithms/VLE.hpp"
 #include "teqp/algorithms/VLLE.hpp"
+#include "teqp/algorithms/density_solver.hpp"
 
 namespace teqp{
     namespace cppinterface{
@@ -27,6 +28,31 @@ namespace teqp{
 
         double AbstractModel::dpsatdT_pure(const double T, const double rhoL, const double rhoV) const {
             return teqp::dpsatdT_pure(*this, T, rhoL, rhoV);
+        }
+
+        double AbstractModel::solve_density(
+            const double T, const double P, const REArrayd& molefracs,
+            const std::string& mode
+        ) const {
+            return teqp::density_solver::solve_density(
+                *this, T, P, molefracs.eval(), mode);
+        }
+
+        std::vector<double> AbstractModel::solve_density_roots(
+            const double T, const double P, const REArrayd& molefracs,
+            const std::string& mode
+        ) const {
+            return teqp::density_solver::solve_density_roots(
+                *this, T, P, molefracs.eval(), mode);
+        }
+
+        double AbstractModel::solve_density_from_guess(
+            const double T, const double P, const REArrayd& molefracs,
+            const double rho_guess,
+            const std::string& mode
+        ) const {
+            return teqp::density_solver::solve_density_from_guess(
+                *this, T, P, molefracs.eval(), rho_guess, mode);
         }
     
         std::tuple<VLLE::VLLE_return_code,EArrayd,EArrayd,EArrayd> AbstractModel::mix_VLLE_T(const double T, const REArrayd& rhovecVinit, const REArrayd& rhovecL1init, const REArrayd& rhovecL2init, const double atol, const double reltol, const double axtol, const double relxtol, const int maxiter) const{

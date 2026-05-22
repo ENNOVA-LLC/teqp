@@ -14,6 +14,7 @@
 #include "teqp/models/saft/pcsaftpure.hpp"
 #include "teqp/models/saft/polar_terms/GrossVrabec.hpp"
 #include "teqp/models/saft/polar_terms/JogChapman.hpp"
+#include "teqp/cpp/model_kind.hpp"
 #include <optional>
 
 // Definitions for the matrices of global constants for the PCSAFT model
@@ -563,10 +564,31 @@ public:
         }
         return 6 * 0.74 / EIGEN_PI / (mole_fractions*m*powvec(d, 3)).sum()*1e30; // particles/m^3
     }
+
+    /// Mixture hard-chain volume [m^3/mol] used by the C++ density solver
+    /// to non-dimensionalize the volume root as eta = b_mix * rho.
+    ///   b_mix = (pi/6) * N_A * sum_i x_i m_i d_i(T)^3
+    ///   d_i(T) = sigma_i * (1 - 0.12 * exp(-3 * epsilon_i/(k_B T))).
+    /// d_i is stored in Angstrom inside this class; the 1e-30 converts the sum to m^3.
+    template<typename VecType>
+    double get_bmix(const double T, const VecType& mole_fractions) const {
+        auto N = mole_fractions.size();
+        Eigen::ArrayX<double> d(N);
+        for (auto i = 0; i < N; ++i) {
+            d[i] = sigma_Angstrom[i] * (1.0 - 0.12 * exp(-3.0 * epsilon_over_k[i] / T));
+        }
+        return (EIGEN_PI / 6.0) * N_A
+               * (mole_fractions * m * powvec(d, 3)).sum() * 1e-30;
+    }
     
     template<class VecType>
     auto R(const VecType& molefrac) const {
         return get_R_gas<decltype(molefrac[0])>();
+    }
+
+    /// Coarse model-family tag
+    teqp::cppinterface::ModelKind get_model_kind() const {
+        return teqp::cppinterface::ModelKind::SAFT;
     }
 
     template<typename TTYPE, typename RhoType, typename VecType>
