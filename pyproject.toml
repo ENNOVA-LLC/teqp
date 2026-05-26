@@ -13,8 +13,10 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "teqp"
-version = "0.23.1"
-description = "teqp: Templated EQuation of state Package"
+# ENNOVA fork version.  Format: <upstream-version>+ennova.<iteration>.
+# See RELEASING.md for the release/version-bump workflow.
+version = "0.23.1+ennova.1"
+description = "teqp: Templated EQuation of state Package (ENNOVA fork)"
 readme = "README.md"
 requires-python = ">=3.8"
 authors = [
