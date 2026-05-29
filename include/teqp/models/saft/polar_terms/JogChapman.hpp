@@ -58,25 +58,72 @@ auto get_I3(const EtaType& eta) {
 
 /**
  \brief Dipolar contribution from Jog & Chapman / Dominik et al.
+![1780063830775](image/JogChapman/1780063830775.png)![1780063854560](image/JogChapman/1780063854560.png)
+ Inputs match the published JC formulation directly:
+
+ - ``m`` segment number per species (dimensionless).
+ - ``xp`` fraction of dipolar segments on the chain (dimensionless).
+ - ``mu_squared_SI`` molecular dipole moment squared, in SI units (C^2 m^2).
+   To convert from Debye^2: multiply by ``(3.33564e-30)^2``. Marshall's
+   polar strength ``alpha_p = m x_p mu^2`` (in D^2) can be supplied as
+   ``mu_squared_SI = alpha_p_D2 * (3.33564e-30)^2 / (m * xp)`` if your
+   data is in that form.
+ - ``sigmaij_rule`` (default ``geometric``) chooses the d_ij combining
+   rule. ``geometric`` (d_ij = sqrt(d_i d_j)) is the AM 2024 / Marshall
+   convention and lets the i,j and i,j,k sums collapse to O(N).
+   ``arithmetic`` (d_ij = (d_i + d_j)/2) is the more general Lorentz-
+   Berthelot rule; it evaluates the full O(N^2) / O(N^3) sums.
+
+ At every ``eval()`` call the caller supplies ``d_Angstrom``, the per-
+ segment diameter used in the polar pair integral. This class applies
+ no transformation to that diameter -- the caller chooses what to pass:
+
+ - PC-SAFT-with-JC: d_i(T) = sigma_i * (1 - 0.12 exp(-3 eps_i/(k_B T)))
+   (the Chen-Kreglewski hard-chain diameter, recomputed per call).
+ - Cubic-SAFT (Abutaqiya-Marshall 2024 SP-SRK): d_i = (3 b_i / (2 pi N_A))^(1/3)
+   (the cubic-derived diameter, temperature-independent).
+
+ The kernel formula is (Marshall-Bokis 2019 / AM 2024 / Dominik 2005):
+
+     a_2^DD = -(2 pi / 9) (1/(4 pi eps_0))^2 * rho / (k_B T)^2
+              * Sum_ij x_i x_j m_i m_j x_p,i x_p,j mu^2_i mu^2_j / d_ij^3 * I_2(eta)
+
+ With geometric d_ij the i,j sum collapses to a single sum squared;
+ with arithmetic d_ij it does not factor and the full pair sum runs.
  */
 class DipolarContributionJogChapman {
 private:
-    const Eigen::ArrayXd m, sigma_Angstrom, epsilon_over_k, mustar2, xp;
+    const Eigen::ArrayXd m, xp, mu_squared_SI;
+    const SigmaijRule sigmaij_rule;
+    // Physical constants (SI)
+    static constexpr double FOUR_PI_EPS0 = 1.11265005605362e-10;  // 4*pi*eps_0 [C^2/(N m^2)]
+    static constexpr double K_B = 1.380649e-23;                    // Boltzmann [J/K]
+
+    /// d_ij in meters, given d_i and d_j in meters and the active rule.
+    template <typename DType>
+    auto pair_d(const DType& d_i, const DType& d_j) const {
+        if (sigmaij_rule == SigmaijRule::geometric) {
+            return forceeval(sqrt(d_i * d_j));
+        }
+        return forceeval(0.5 * (d_i + d_j));
+    }
+
 public:
     const bool has_a_polar;
 
+    /// Construct with raw per-species inputs in SI / dimensionless units.
+    /// ``mu_squared_SI[i]`` is the molecule's dipole moment squared in C^2 m^2.
     DipolarContributionJogChapman(
         const Eigen::ArrayX<double>& m,
-        const Eigen::ArrayX<double>& sigma_Angstrom,
-        const Eigen::ArrayX<double>& epsilon_over_k,
-        const Eigen::ArrayX<double>& mustar2,
-        const Eigen::ArrayX<double>& xp)
-    : m(m), sigma_Angstrom(sigma_Angstrom), epsilon_over_k(epsilon_over_k),
-      mustar2(mustar2), xp(xp),
-      has_a_polar((mustar2 * xp).cwiseAbs().sum() > 0)
+        const Eigen::ArrayX<double>& xp,
+        const Eigen::ArrayX<double>& mu_squared_SI,
+        SigmaijRule sigmaij_rule = SigmaijRule::geometric)
+    : m(m), xp(xp), mu_squared_SI(mu_squared_SI),
+      sigmaij_rule(sigmaij_rule),
+      has_a_polar((mu_squared_SI * xp).cwiseAbs().sum() > 0)
     {
-        if (m.size() != mustar2.size()) {
-            throw teqp::InvalidArgument("bad size of mustar2");
+        if (m.size() != mu_squared_SI.size()) {
+            throw teqp::InvalidArgument("bad size of mu_squared_SI");
         }
         if (m.size() != xp.size()) {
             throw teqp::InvalidArgument("bad size of xp");
@@ -84,72 +131,122 @@ public:
     }
     DipolarContributionJogChapman& operator=(const DipolarContributionJogChapman&) = delete;
 
-    /// Compute the temperature-dependent Chen-Kreglewski segment diameter
-    /// d_i = sigma_i * (1 - 0.12 * exp(-3 eps_i / (k T)))
-    /// matching the convention used by PCSAFTHardChainContribution.
-    template <typename TTYPE>
-    auto get_d(const TTYPE& T) const {
-        Eigen::ArrayX<TTYPE> d(m.size());
-        for (Eigen::Index i = 0; i < m.size(); ++i) {
-            d[i] = sigma_Angstrom[i] * (1.0 - 0.12 * exp(-3.0 * epsilon_over_k[i] / T));
-        }
-        return d;
-    }
-
-    /// A2 contribution. Dominik Eq. 3, with I2 pulled out of the i,j sum
-    /// (it depends only on eta and m_bar) and d_ij = sqrt(d_i d_j) so the
-    /// d_ij^3 prefactor separates as d_i^{3/2} d_j^{3/2}. The double sum
-    /// collapses to ( sum_i a_i )^2 with a_i = x_i m_i x_p,i (mu*_i)^2
-    /// (eps_i / kT) sigma_i^3 / d_i^{3/2}.
-    template <typename TTYPE, typename RhoType, typename EtaType, typename VecType>
-    auto get_alpha2DD(const TTYPE& T, const RhoType& rhoN_A3, const EtaType& eta, const VecType& mole_fractions) const {
+    /// A2 contribution. Dominik 2005 Eq. 3 / Marshall-Bokis 2019.
+    ///
+    /// Geometric d_ij path (default): the i,j double sum collapses to
+    ///     S = Sum_i x_i m_i x_p,i mu^2_i / d_i^{3/2}
+    ///     a_2 = -(2 pi / 9) / (4 pi eps_0)^2 * rho_N / (k_B T)^2 * I_2(eta) * S^2
+    /// where rho_N is the number density in particles/m^3.
+    ///
+    /// Arithmetic d_ij path: full O(N^2) pair sum,
+    ///     a_2 = -(2 pi / 9) / (4 pi eps_0)^2 * rho_N / (k_B T)^2 * I_2(eta)
+    ///           * Sum_ij x_i x_j m_i m_j x_p,i x_p,j mu^2_i mu^2_j / d_ij^3
+    template <typename TTYPE, typename RhoType, typename EtaType, typename VecType, typename DVecType>
+    auto get_alpha2DD(const TTYPE& T, const RhoType& rhoN_A3, const EtaType& eta,
+                       const VecType& mole_fractions, const DVecType& d_Angstrom) const {
         const auto& x = mole_fractions;
-        const auto& sigma = sigma_Angstrom;
         const auto N = mole_fractions.size();
-        auto d = get_d(T);
 
-        using sum_t = std::common_type_t<TTYPE, RhoType, EtaType, decltype(mole_fractions[0])>;
-        sum_t S = 0.0;
-        for (Eigen::Index i = 0; i < N; ++i) {
-            if (xp[i] * mustar2[i] == 0) continue;
-            S += x[i] * m[i] * xp[i] * mustar2[i] * (epsilon_over_k[i] / T)
-                 * POW3(sigma[i]) / pow(d[i], 1.5);
-        }
+        using sum_t = std::common_type_t<TTYPE, RhoType, EtaType,
+                                          decltype(mole_fractions[0]), decltype(d_Angstrom[0])>;
         auto I2 = get_I2(eta);
-        // Sign and 2*pi/9 prefactor follow Dominik Eq. 3 (after folding eps/kT
-        // into the per-component scalar so the units match GV's (mu*)^2 form).
-        return forceeval(-2.0 * static_cast<double>(EIGEN_PI) / 9.0 * rhoN_A3 * I2 * S * S);
-    }
+        auto rho_N_m3 = rhoN_A3 * 1e30;
+        const double prefactor = -2.0 * static_cast<double>(EIGEN_PI) / 9.0
+                                  / (FOUR_PI_EPS0 * FOUR_PI_EPS0);
 
-    /// A3 contribution. Dominik Eq. 4. With d_ij = sqrt(d_i d_j), the triple
-    /// prefactor 1/(d_ij d_ik d_jk) = 1/(d_i d_j d_k) exactly, and the I3
-    /// kernel is mole-fraction-averaged, so the triple sum collapses to
-    /// ( sum_i b_i )^3 with b_i = x_i m_i x_p,i (mu*_i)^2 (eps_i / kT) sigma_i^3 / d_i.
-    template <typename TTYPE, typename RhoType, typename EtaType, typename VecType>
-    auto get_alpha3DD(const TTYPE& T, const RhoType& rhoN_A3, const EtaType& eta, const VecType& mole_fractions) const {
-        const auto& x = mole_fractions;
-        const auto& sigma = sigma_Angstrom;
-        const auto N = mole_fractions.size();
-        auto d = get_d(T);
-
-        using sum_t = std::common_type_t<TTYPE, RhoType, EtaType, decltype(mole_fractions[0])>;
-        sum_t S = 0.0;
-        for (Eigen::Index i = 0; i < N; ++i) {
-            if (xp[i] * mustar2[i] == 0) continue;
-            S += x[i] * m[i] * xp[i] * mustar2[i] * (epsilon_over_k[i] / T)
-                 * POW3(sigma[i]) / d[i];
+        if (sigmaij_rule == SigmaijRule::geometric) {
+            // Collapsed O(N) form. S = Sum_i x_i m_i x_p,i mu^2_i / d_i^{3/2}
+            sum_t S = 0.0;
+            for (Eigen::Index i = 0; i < N; ++i) {
+                if (xp[i] * mu_squared_SI[i] == 0) continue;
+                auto d_m = d_Angstrom[i] * 1e-10;       // Angstrom -> meters
+                S += x[i] * m[i] * xp[i] * mu_squared_SI[i] / pow(d_m, 1.5);
+            }
+            return forceeval(prefactor * rho_N_m3 / (K_B * K_B * T * T) * I2 * S * S);
+        } else {
+            // Arithmetic d_ij: full O(N^2) pair sum, no collapse.
+            sum_t summer = 0.0;
+            for (Eigen::Index i = 0; i < N; ++i) {
+                if (xp[i] * mu_squared_SI[i] == 0) continue;
+                auto d_i_m = d_Angstrom[i] * 1e-10;
+                for (Eigen::Index j = 0; j < N; ++j) {
+                    if (xp[j] * mu_squared_SI[j] == 0) continue;
+                    auto d_j_m = d_Angstrom[j] * 1e-10;
+                    auto d_ij = pair_d(d_i_m, d_j_m);
+                    summer += x[i] * x[j] * m[i] * m[j] * xp[i] * xp[j]
+                              * mu_squared_SI[i] * mu_squared_SI[j]
+                              / (d_ij * d_ij * d_ij);
+                }
+            }
+            return forceeval(prefactor * rho_N_m3 / (K_B * K_B * T * T) * I2 * summer);
         }
-        auto I3 = get_I3(eta);
-        // 5 pi^2 / 162 prefactor from Dominik Eq. 4 / JC 1999 Eq. 28 second term.
-        return forceeval(-5.0 * POW2(static_cast<double>(EIGEN_PI)) / 162.0
-                          * POW2(rhoN_A3) * I3 * S * S * S);
     }
 
-    /// Padé-resummed dipolar contribution: alpha = alpha2 / (1 - alpha3/alpha2)
-    template <typename TTYPE, typename RhoType, typename EtaType, typename VecType>
-    auto eval(const TTYPE& T, const RhoType& rho_A3, const EtaType& eta, const VecType& mole_fractions) const {
-        auto alpha2 = get_alpha2DD(T, rho_A3, eta, mole_fractions);
-        auto alpha3 = get_alpha3DD(T, rho_A3, eta, mole_fractions);
+    /// A3 contribution. Dominik 2005 Eq. 4.
+    ///
+    /// Geometric d_ij path: the i,j,k triple sum collapses to a single
+    /// sum cubed,
+    ///     S = Sum_i x_i m_i x_p,i mu^2_i / d_i
+    ///     a_3 = -(5 pi^2 / 162) / (4 pi eps_0)^3 * rho_N^2 / (k_B T)^3 * I_3(eta) * S^3
+    ///
+    /// Arithmetic d_ij path: full O(N^3) triple sum.
+    template <typename TTYPE, typename RhoType, typename EtaType, typename VecType, typename DVecType>
+    auto get_alpha3DD(const TTYPE& T, const RhoType& rhoN_A3, const EtaType& eta,
+                       const VecType& mole_fractions, const DVecType& d_Angstrom) const {
+        const auto& x = mole_fractions;
+        const auto N = mole_fractions.size();
+
+        using sum_t = std::common_type_t<TTYPE, RhoType, EtaType,
+                                          decltype(mole_fractions[0]), decltype(d_Angstrom[0])>;
+        auto I3 = get_I3(eta);
+        auto rho_N_m3 = rhoN_A3 * 1e30;
+        const double pi_d = static_cast<double>(EIGEN_PI);
+        const double prefactor = -5.0 * pi_d * pi_d / 162.0
+                                  / (FOUR_PI_EPS0 * FOUR_PI_EPS0 * FOUR_PI_EPS0);
+
+        if (sigmaij_rule == SigmaijRule::geometric) {
+            sum_t S = 0.0;
+            for (Eigen::Index i = 0; i < N; ++i) {
+                if (xp[i] * mu_squared_SI[i] == 0) continue;
+                auto d_m = d_Angstrom[i] * 1e-10;
+                S += x[i] * m[i] * xp[i] * mu_squared_SI[i] / d_m;
+            }
+            return forceeval(prefactor * POW2(rho_N_m3) / (K_B * K_B * K_B * T * T * T)
+                              * I3 * S * S * S);
+        } else {
+            // Arithmetic d_ij: full O(N^3) triple sum, no collapse.
+            sum_t summer = 0.0;
+            for (Eigen::Index i = 0; i < N; ++i) {
+                if (xp[i] * mu_squared_SI[i] == 0) continue;
+                auto d_i_m = d_Angstrom[i] * 1e-10;
+                for (Eigen::Index j = 0; j < N; ++j) {
+                    if (xp[j] * mu_squared_SI[j] == 0) continue;
+                    auto d_j_m = d_Angstrom[j] * 1e-10;
+                    auto d_ij = pair_d(d_i_m, d_j_m);
+                    for (Eigen::Index k = 0; k < N; ++k) {
+                        if (xp[k] * mu_squared_SI[k] == 0) continue;
+                        auto d_k_m = d_Angstrom[k] * 1e-10;
+                        auto d_ik = pair_d(d_i_m, d_k_m);
+                        auto d_jk = pair_d(d_j_m, d_k_m);
+                        summer += x[i] * x[j] * x[k]
+                                  * m[i] * m[j] * m[k]
+                                  * xp[i] * xp[j] * xp[k]
+                                  * mu_squared_SI[i] * mu_squared_SI[j] * mu_squared_SI[k]
+                                  / (d_ij * d_ik * d_jk);
+                    }
+                }
+            }
+            return forceeval(prefactor * POW2(rho_N_m3) / (K_B * K_B * K_B * T * T * T)
+                              * I3 * summer);
+        }
+    }
+
+    /// Padé-resummed dipolar contribution: alpha = alpha2 / (1 - alpha3/alpha2).
+    template <typename TTYPE, typename RhoType, typename EtaType, typename VecType, typename DVecType>
+    auto eval(const TTYPE& T, const RhoType& rho_A3, const EtaType& eta,
+              const VecType& mole_fractions, const DVecType& d_Angstrom) const {
+        auto alpha2 = get_alpha2DD(T, rho_A3, eta, mole_fractions, d_Angstrom);
+        auto alpha3 = get_alpha3DD(T, rho_A3, eta, mole_fractions, d_Angstrom);
         auto alpha = forceeval(alpha2 / (1.0 - alpha3 / alpha2));
 
         using alpha2_t = decltype(alpha2);
@@ -198,46 +295,60 @@ public:
     const std::optional<GrossVrabec::QuadrupolarContributionGross> quad;
     const std::optional<GrossVrabec::DipolarQuadrupolarContributionVrabecGross> diquad;
 
+    /// Construct the JC aggregator.
+    ///
+    /// JC dipolar branch consumes (m, xp, mu_squared_SI) directly --
+    /// see DipolarContributionJogChapman for unit conventions.
+    /// GV quadrupolar and cross-DQ branches still consume
+    /// (m, sigma_Angstrom, epsilon_over_k, ...) because GV's published
+    /// kernel uses those parameters explicitly. The cross-DQ class also
+    /// needs mu_star^2 in GV's reduced form, which the caller must
+    /// supply alongside the raw mu^2 if the cross term is wanted; if
+    /// only the JC dipolar branch is needed, pass mustar2_GV = 0 to
+    /// disable the cross-DQ branch.
     MultipolarContributionJogChapman(
         const Eigen::ArrayX<double>& m,
         const Eigen::ArrayX<double>& sigma_Angstrom,
         const Eigen::ArrayX<double>& epsilon_over_k,
-        const Eigen::ArrayX<double>& mustar2,
+        const Eigen::ArrayX<double>& mu_squared_SI,
         const Eigen::ArrayX<double>& xp,
         const Eigen::ArrayX<double>& Qstar2,
         const Eigen::ArrayX<double>& nQ,
+        const Eigen::ArrayX<double>& mustar2_GV_for_cross_DQ,
         SigmaijRule sigmaij_rule = SigmaijRule::geometric)
-    // The JC dipolar branch is hard-coded geometric (it relies on the
-    // collapsed sums); the sigmaij_rule argument is forwarded only to
-    // the GV quadrupolar and cross-DQ branches so the user can choose
-    // arithmetic-vs-geometric for the Q-side consistently with the
-    // chosen polar_combining_rule. Default is geometric for parallelism
-    // with the JC dipolar branch.
-    : di((((xp * mustar2 > 0).cast<int>().sum() > 0)
-              ? decltype(di)(DipolarContributionJogChapman(m, sigma_Angstrom, epsilon_over_k, mustar2, xp))
+    : di((((xp * mu_squared_SI > 0).cast<int>().sum() > 0)
+              ? decltype(di)(DipolarContributionJogChapman(m, xp, mu_squared_SI, sigmaij_rule))
               : std::nullopt)),
       quad((((nQ * Qstar2 > 0).cast<int>().sum() > 0)
               ? decltype(quad)(GrossVrabec::QuadrupolarContributionGross(m, sigma_Angstrom, epsilon_over_k, Qstar2, nQ, sigmaij_rule))
               : std::nullopt)),
       // Cross DQ requires *both* dipole and quadrupole. The GV cross-DQ class
-      // expects an nmu input, which JC doesn't carry natively -- derive it
-      // from xp (n_mu = m * x_p) so the GV term sees a consistent count.
-      diquad((di && quad)
+      // expects an nmu input (GV's reduced dipole convention), which JC doesn't
+      // carry natively -- the caller must supply mustar2_GV_for_cross_DQ along
+      // with a derived nmu = m * xp so the GV term sees a consistent count.
+      diquad((di && quad && (mustar2_GV_for_cross_DQ * xp > 0).cast<int>().sum() > 0)
               ? decltype(diquad)(GrossVrabec::DipolarQuadrupolarContributionVrabecGross(
-                    m, sigma_Angstrom, epsilon_over_k, mustar2,
+                    m, sigma_Angstrom, epsilon_over_k, mustar2_GV_for_cross_DQ,
                     (m * xp).eval(), Qstar2, nQ, sigmaij_rule))
               : std::nullopt)
     {}
 
-    template <typename TTYPE, typename RhoType, typename EtaType, typename VecType>
-    auto eval(const TTYPE& T, const RhoType& rho_A3, const EtaType& eta, const VecType& mole_fractions) const {
-        using type = std::common_type_t<TTYPE, RhoType, EtaType, decltype(mole_fractions[0])>;
+    /// Evaluate the JC dipolar + GV quadrupolar + GV cross-DQ contributions.
+    /// ``d_Angstrom`` is the per-eval diameter vector consumed by the JC
+    /// dipolar branch only; the GV quadrupolar and cross-DQ branches use
+    /// the construction-time sigma directly (their published kernel has
+    /// no segment-diameter temperature correction).
+    template <typename TTYPE, typename RhoType, typename EtaType, typename VecType, typename DVecType>
+    auto eval(const TTYPE& T, const RhoType& rho_A3, const EtaType& eta,
+              const VecType& mole_fractions, const DVecType& d_Angstrom) const {
+        using type = std::common_type_t<TTYPE, RhoType, EtaType,
+                                         decltype(mole_fractions[0]), decltype(d_Angstrom[0])>;
         type alpha2DD = 0.0, alpha3DD = 0.0, alphaDD = 0.0;
         type alpha2QQ = 0.0, alpha3QQ = 0.0, alphaQQ = 0.0;
         type alpha2DQ = 0.0, alpha3DQ = 0.0, alphaDQ = 0.0;
         if (di && di.value().has_a_polar) {
-            alpha2DD = di.value().get_alpha2DD(T, rho_A3, eta, mole_fractions);
-            alpha3DD = di.value().get_alpha3DD(T, rho_A3, eta, mole_fractions);
+            alpha2DD = di.value().get_alpha2DD(T, rho_A3, eta, mole_fractions, d_Angstrom);
+            alpha3DD = di.value().get_alpha3DD(T, rho_A3, eta, mole_fractions, d_Angstrom);
             alphaDD  = forceeval(alpha2DD / (1.0 - alpha3DD / alpha2DD));
         }
         if (quad && quad.value().has_a_polar) {

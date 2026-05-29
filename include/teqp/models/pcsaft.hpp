@@ -14,6 +14,7 @@
 #include "teqp/models/saft/pcsaftpure.hpp"
 #include "teqp/models/saft/polar_terms/GrossVrabec.hpp"
 #include "teqp/models/saft/polar_terms/JogChapman.hpp"
+#include "teqp/models/saft/segment_diameter.hpp"
 #include "teqp/cpp/model_kind.hpp"
 #include <optional>
 
@@ -230,10 +231,8 @@ public:
         
         using TRHOType = std::common_type_t<std::decay_t<TTYPE>, std::decay_t<RhoType>, std::decay_t<decltype(mole_fractions[0])>, std::decay_t<decltype(m[0])>>;
         
-        Eigen::ArrayX<TTYPE> d(N);
-        for (auto i = 0L; i < N; ++i) {
-            d[i] = sigma_Angstrom[i]*(1.0 - 0.12 * exp(-3.0*epsilon_over_k[i]/T)); // [A]
-        }
+        // Chen-Kreglewski T-dependent segment diameter [A]
+        Eigen::ArrayX<TTYPE> d = teqp::saft::chen_kreglewski_d(T, sigma_Angstrom, epsilon_over_k);
         TRHOType m2_epsilon_sigma3_bar = 0.0;
         TRHOType m2_epsilon2_sigma3_bar = 0.0;
         if (sigmaij_rule == teqp::saft::polar_terms::SigmaijRule::geometric) {
@@ -460,6 +459,29 @@ protected:
         // The dispersive and hard chain initialization has already happened at this point
         return PCSAFTDipolarContribution(m, sigma_Angstrom, epsilon_over_k, mustar2, nmu, polar_sigmaij_rule);
     }
+    /**
+     * \brief Build the Jog-Chapman dipolar contribution from the PCSAFT
+     *        coefficient table.
+     *
+     * \details The PCSAFT JSON schema carries the dipole as the reduced
+     * dimensionless ``(mu^*)^2`` from Gross-Vrabec 2006 (shared input
+     * across teqp's polar layers):
+     * \f[
+     *    (\mu^*)^2 = \frac{\mu^2}{4 \pi \epsilon_0 \, m \, (\epsilon/k_B) \, k_B \, \sigma^3}
+     * \f]
+     * with \f$\epsilon/k_B\f$ in K, \f$\sigma\f$ in m, and \f$\mu\f$ in C·m.
+     * The published JC kernel works in raw \f$\mu^2\f$ (C\f$^2\f$·m\f$^2\f$),
+     * so we invert the reduction here once at construction:
+     * \f[
+     *    \mu_{SI}^2 = (\mu^*)^2 \cdot 4 \pi \epsilon_0 \, m \, (\epsilon/k_B) \, k_B \, \sigma^3
+     * \f]
+     * (single \f$k_B\f$, not \f$k_B^2\f$, because \f$\epsilon/k_B\f$ is the
+     * dimensionless input).
+     *
+     * The polar-segment fraction ``xp`` falls back to ``nmu/m`` when not
+     * supplied directly; see ``docs/eos/polar_theory_mapping.md`` for the
+     * JC ↔ GV parameter mapping.
+     */
     auto build_dipolar_jc(const std::vector<SAFTCoeffs> &coeffs) -> std::optional<PCSAFTDipolarContributionJC>{
         if (polar_model != PolarModel::JogChapman) {
             return std::nullopt;
@@ -468,8 +490,6 @@ protected:
         auto i = 0;
         for (const auto &coeff : coeffs) {
             mustar2[i] = coeff.mustar2;
-            // If the caller supplied xp directly, prefer it; otherwise derive xp = nmu/m
-            // (the standard JC<->GV mapping; see docs/eos/polar_theory_mapping.md).
             xp[i] = (coeff.xp > 0) ? coeff.xp
                                    : ((coeff.m > 0 && coeff.nmu > 0) ? coeff.nmu / coeff.m : 0.0);
             i++;
@@ -477,10 +497,17 @@ protected:
         if ((mustar2 * xp).cwiseAbs().sum() == 0) {
             return std::nullopt; // No dipolar contribution is present
         }
-        // JC's dipolar branch hard-codes geometric d_ij internally; the
-        // polar_sigmaij_rule on this class only affects the GV-derived
-        // quadrupolar and cross-DQ branches reachable through `quadrupolar`.
-        return PCSAFTDipolarContributionJC(m, sigma_Angstrom, epsilon_over_k, mustar2, xp);
+        constexpr double FOUR_PI_EPS0 = 1.11265005605362e-10;
+        constexpr double K_B = 1.380649e-23;
+        Eigen::ArrayXd mu_squared_SI(coeffs.size());
+        for (Eigen::Index k = 0; k < (Eigen::Index)coeffs.size(); ++k) {
+            const double sigma_m = sigma_Angstrom[k] * 1e-10;
+            const double sigma3 = sigma_m * sigma_m * sigma_m;
+            // Invert teqp's (mu*)^2 reduction; see docstring above.
+            mu_squared_SI[k] = mustar2[k] * FOUR_PI_EPS0 * m[k] * epsilon_over_k[k]
+                                * K_B * sigma3;
+        }
+        return PCSAFTDipolarContributionJC(m, xp, mu_squared_SI, polar_sigmaij_rule);
     }
     auto build_quadrupolar(const std::vector<SAFTCoeffs> &coeffs) -> std::optional<PCSAFTQuadrupolarContribution>{
         // The dispersive and hard chain initialization has already happened at this point
@@ -496,11 +523,18 @@ protected:
         }
         return PCSAFTQuadrupolarContribution(m, sigma_Angstrom, epsilon_over_k, Qstar2, nQ, polar_sigmaij_rule);
     }
-    /// Pick the polar sigma_ij combining rule when the caller did not pin
-    /// it explicitly: JogChapman defaults to geometric (its dipolar branch
-    /// is hard-coded geometric anyway, and the GV quadrupolar/cross-DQ
-    /// pieces match for internal consistency); GrossVrabec defaults to
-    /// arithmetic (Lorentz-Berthelot, the historical behavior).
+    /**
+     * \brief Pick the polar \f$\sigma_{ij}\f$ combining rule when the caller
+     *        did not pin it explicitly.
+     *
+     * \details Per-polar-model defaults:
+     * - JogChapman: ``geometric`` (Marshall convention; the O(N) collapse of
+     *   JC's pair sums requires it).
+     * - GrossVrabec: ``arithmetic`` (Lorentz-Berthelot, the historical
+     *   behavior; GV's pair-resolved kernel supports either rule).
+     *
+     * An explicit ``override_rule`` always wins.
+     */
     static teqp::saft::polar_terms::SigmaijRule resolve_polar_sigmaij_rule(
         PolarModel pm,
         std::optional<teqp::saft::polar_terms::SigmaijRule> override_rule)
@@ -557,26 +591,18 @@ public:
     
     template<typename VecType>
     double max_rhoN(const double T, const VecType& mole_fractions) const {
-        auto N = mole_fractions.size();
-        Eigen::ArrayX<double> d(N);
-        for (auto i = 0; i < N; ++i) {
-            d[i] = sigma_Angstrom[i] * (1.0 - 0.12 * exp(-3.0 * epsilon_over_k[i] / T));
-        }
+        Eigen::ArrayX<double> d = teqp::saft::chen_kreglewski_d(T, sigma_Angstrom, epsilon_over_k);
         return 6 * 0.74 / EIGEN_PI / (mole_fractions*m*powvec(d, 3)).sum()*1e30; // particles/m^3
     }
 
     /// Mixture hard-chain volume [m^3/mol] used by the C++ density solver
     /// to non-dimensionalize the volume root as eta = b_mix * rho.
     ///   b_mix = (pi/6) * N_A * sum_i x_i m_i d_i(T)^3
-    ///   d_i(T) = sigma_i * (1 - 0.12 * exp(-3 * epsilon_i/(k_B T))).
-    /// d_i is stored in Angstrom inside this class; the 1e-30 converts the sum to m^3.
+    /// with d_i(T) the Chen-Kreglewski diameter (see segment_diameter.hpp).
+    /// d_i is in Angstrom inside this class; the 1e-30 converts the sum to m^3.
     template<typename VecType>
     double get_bmix(const double T, const VecType& mole_fractions) const {
-        auto N = mole_fractions.size();
-        Eigen::ArrayX<double> d(N);
-        for (auto i = 0; i < N; ++i) {
-            d[i] = sigma_Angstrom[i] * (1.0 - 0.12 * exp(-3.0 * epsilon_over_k[i] / T));
-        }
+        Eigen::ArrayX<double> d = teqp::saft::chen_kreglewski_d(T, sigma_Angstrom, epsilon_over_k);
         return (EIGEN_PI / 6.0) * N_A
                * (mole_fractions * m * powvec(d, 3)).sum() * 1e-30;
     }
@@ -604,8 +630,14 @@ public:
             alphar += valsdip.alpha;
         }
         // JC dipolar (active when polar_model == JogChapman); mutually exclusive with `dipolar`.
+        // JC's polar pair integral uses the Chen-Kreglewski temperature-dependent
+        // segment diameter d_i(T) = sigma_i * (1 - 0.12 * exp(-3 eps_i/(k_B T))).
+        // The JC class itself does not apply this correction (the caller is
+        // responsible for whatever diameter convention is appropriate; see
+        // JogChapman.hpp). Here we compute the standard CK d(T) and pass it.
         if (dipolar_jc){
-            auto valsdip = dipolar_jc.value().eval(T, rho_A3, vals.eta, mole_fractions);
+            auto d_Angstrom = teqp::saft::chen_kreglewski_d(T, sigma_Angstrom, epsilon_over_k);
+            auto valsdip = dipolar_jc.value().eval(T, rho_A3, vals.eta, mole_fractions, d_Angstrom);
             alphar += valsdip.alpha;
         }
         // If quadrupole is present, add its contribution

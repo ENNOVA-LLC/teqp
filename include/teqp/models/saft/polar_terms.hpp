@@ -695,10 +695,21 @@ public:
     }
 };
 
-/// The variant containing the multipolar types that can be provided
+/// The variant containing the multipolar types that can be provided to
+/// the SAFT-VR-Mie polar slot.
+///
+/// MultipolarContributionJogChapman was previously included here but
+/// removed after the JC kernel was refactored to require a per-eval
+/// ``d_Angstrom`` argument (Marshall's published form). The variant
+/// visitor in saftvrmie.hpp uses a uniform 4-argument ``eval()`` call
+/// that doesn't supply a diameter, so JC could not satisfy that
+/// interface. PC-SAFT and Cubic-SAFT use JC directly (without going
+/// through this variant), so they remain supported. SAFT-VR-Mie with
+/// the JC polar kernel is not currently wired; if needed, the JC
+/// aggregator would need a separate evaluation path that the visitor
+/// dispatches to via a multipolar_argument_spec tag.
 using multipolar_contributions_variant = std::variant<
     teqp::saft::polar_terms::GrossVrabec::MultipolarContributionGrossVrabec,
-    teqp::saft::polar_terms::JogChapman::MultipolarContributionJogChapman,
     MultipolarContributionGrayGubbins<GubbinsTwuJIntegral, GubbinsTwuKIntegral>,
     MultipolarContributionGrayGubbins<GottschalkJIntegral, GottschalkKIntegral>,
     MultipolarContributionGrayGubbins<LuckasJIntegral, LuckasKIntegral>,

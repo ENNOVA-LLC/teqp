@@ -20,6 +20,7 @@ The implementation follows the approach of Langenbach for the index compression,
 #include <Eigen/Dense>
 #include "teqp/math/pow_templates.hpp"
 #include "teqp/models/association/association_types.hpp"
+#include "teqp/models/saft/segment_diameter.hpp"
 #include "teqp/json_tools.hpp"
 
 namespace teqp{
@@ -341,12 +342,13 @@ public:
                     // here we trust the construction-time check.
                     using namespace teqp::constants;
                     const auto N = molefracs.size();
-                    Eigen::Array<d_t, Eigen::Dynamic, 1> d_arr(N);
+                    // Chen-Kreglewski / Barker-Henderson T-dependent diameter [m].
+                    // Centralized helper; see teqp/models/saft/segment_diameter.hpp.
+                    Eigen::Array<d_t, Eigen::Dynamic, 1> d_arr =
+                        teqp::saft::chen_kreglewski_d(T, d.sigma_m, d.epsilon_over_k_K);
                     bmcsl_t n2 = 0.0, n3 = 0.0;
                     const double PI_LOCAL = EIGEN_PI;
                     for (auto i = 0; i < N; ++i){
-                        // Barker-Henderson temperature-dependent segment diameter [m]
-                        d_arr[i] = d.sigma_m[i] * (1.0 - 0.12*exp(-3.0*d.epsilon_over_k_K[i]/T));
                         // Number density of segments of species i:
                         //   rho_seg_i = rhomolar * x_i * N_A * m_i
                         auto rho_seg_i = rhomolar * molefracs[i] * N_A * d.m_segments[i];

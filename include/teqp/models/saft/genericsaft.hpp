@@ -4,18 +4,24 @@
 #include "teqp/models/saftvrmie.hpp"
 #include "teqp/models/association/association.hpp"
 #include "teqp/models/saft/softsaft.hpp"
+#include "teqp/models/saft/cubicsaft.hpp"
 #include "teqp/models/model_potentials/2center_ljf.hpp"
 
 namespace teqp::saft::genericsaft{
 
 struct GenericSAFT{
-    
+
 public:
     using TwoCLJ = twocenterljf::Twocenterljf<twocenterljf::DipolarContribution>;
-    using NonPolarTerms = std::variant<saft::pcsaft::PCSAFTMixture, SAFTVRMie::SAFTVRMieNonpolarMixture, saft::softsaft::SoftSAFT, TwoCLJ>;
+    using NonPolarTerms = std::variant<
+        saft::pcsaft::PCSAFTMixture,
+        SAFTVRMie::SAFTVRMieNonpolarMixture,
+        saft::softsaft::SoftSAFT,
+        saft::cubicsaft::CubicSAFTNonpolarMixture,
+        TwoCLJ>;
 //    using PolarTerms = EOSTermContainer<>;
     using AssociationTerms = std::variant<association::Association>;
-    
+
 private:
     auto make_nonpolar(const nlohmann::json &j) -> NonPolarTerms{
         std::string kind = j.at("kind");
@@ -27,6 +33,9 @@ private:
         }
         else if (kind == "Johnson+Johnson" || kind == "softSAFT"){
             return saft::softsaft::SoftSAFT(j.at("model"));
+        }
+        else if (kind == "cubic" || kind == "CubicSAFT" || kind == "CPCA"){
+            return saft::cubicsaft::CubicSAFTfactory(j.at("model"));
         }
         else if (kind == "2CLJF" || kind == "2CLJ"){
             const auto& model = j.at("model");
