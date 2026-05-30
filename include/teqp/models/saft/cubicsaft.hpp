@@ -62,6 +62,7 @@
 #include "teqp/exceptions.hpp"
 #include "teqp/math/pow_templates.hpp"
 #include "teqp/models/saft/polar_terms.hpp"
+#include "teqp/models/saft/peneloux_shift.hpp"
 #include "teqp/models/association/association_types.hpp"
 
 namespace teqp::saft::cubicsaft {
@@ -88,27 +89,91 @@ inline ChainRDF parse_chain_rdf(const std::string& s) {
     throw teqp::InvalidArgument("Unrecognized chain RDF: " + s + " (expected 'Elliott'/'KG' or 'CS')");
 }
 
+/**
+ * \brief Selector for the paired (alpha, beta) temperature-dependence scheme.
+ *
+ * \details Conceptually analogous to choosing a Soave alpha function: the
+ * scheme is an *EOS-family* property, not a per-species fittable parameter.
+ * Alajmi-Sisco 2022 is a package deal that replaces *both* the user-supplied
+ * Soave kappa on the attraction side *and* introduces a covolume (v0)
+ * temperature dependence on the repulsive side, with all three constants
+ * coming from the same MW correlation set.
+ *
+ *   None             -> Soave alpha with user-supplied c1 (kappa_alpha) on a(T)
+ *                       and T-independent b = b_0 (the existing baseline).
+ *   AlajmiSisco2022  -> kappa_alpha, kappa_beta1, kappa_beta2 all replaced by
+ *                       Alajmi-Sisco 2022 Table 1 MW correlations:
+ *                         a(T) = a_0 * (1 + kappa_alpha * (1 - sqrt(T/Tc)))^2
+ *                         b(T) = b_0 * kappa_beta1 * exp(-kappa_beta2 * T/Tc)
+ */
+enum class AlphaBetaScheme { None, AlajmiSisco2022 };
+
+inline AlphaBetaScheme parse_alpha_beta_scheme(const std::string& s) {
+    if (s.empty() || s == "none" || s == "None") return AlphaBetaScheme::None;
+    if (s == "alajmi-2022" || s == "alajmi-sisco-2022" || s == "AlajmiSisco2022") {
+        return AlphaBetaScheme::AlajmiSisco2022;
+    }
+    throw teqp::InvalidArgument(
+        "Unrecognized alpha_beta_scheme: " + s + " (expected 'none' or 'alajmi-2022')");
+}
+
+/// Alajmi-Sisco 2022 constants for a single species at MW [g/mol].
+struct AlajmiConstants {
+    double kappa_alpha;   ///< replaces user-supplied c1 in the Soave alpha function
+    double kappa_beta1;   ///< b(T) prefactor in beta_T(T) = kappa_beta1 * exp(-kappa_beta2 * T/Tc)
+    double kappa_beta2;   ///< b(T) exponential decay rate (in reduced T)
+};
+
+/**
+ * \brief Alajmi-Sisco 2022 Table 1 MW correlations.
+ *
+ * \details Returns the trio (kappa_alpha, kappa_beta1, kappa_beta2) for a single
+ * species at molecular weight ``MW`` [g/mol] via the published SRK
+ * correlations:
+ * \f[
+ *     \kappa_\alpha   = 0.2425 \cdot \text{MW}^{0.2829}
+ * \f]
+ * \f[
+ *     \kappa_{\beta 1} = 0.7112 \cdot \text{MW}^{0.1502}
+ * \f]
+ * \f[
+ *     \kappa_{\beta 2} = 0.1549 \cdot \ln(\text{MW}) - 0.3224
+ * \f]
+ *
+ * The Alajmi-Sisco 2022 paper fits these constants against SRK reference data.
+ * No PR-specific refit has been published, so calling this with
+ * ``CubicVariant::PR`` raises ``InvalidArgument``. Remove the guard once a
+ * validated PR coefficient set is available.
+ */
+inline AlajmiConstants alajmi_kappa(double MW, CubicVariant variant) {
+    if (MW <= 0) {
+        throw teqp::InvalidArgument(
+            "alajmi_kappa requires MW > 0; got " + std::to_string(MW));
+    }
+    if (variant == CubicVariant::PR) {
+        throw teqp::InvalidArgument(
+            "alpha_beta_scheme='alajmi-2022' is only validated for SRK in "
+            "Alajmi-Sisco 2022. PR-monomer constants have not been published; "
+            "select 'none' for PR-cubic-SAFT or use SRK-cubic-SAFT.");
+    }
+    return AlajmiConstants{
+        /*kappa_alpha=*/0.2425 * std::pow(MW, 0.2829),
+        /*kappa_beta1=*/0.7112 * std::pow(MW, 0.1502),
+        /*kappa_beta2=*/0.1549 * std::log(MW) - 0.3224,
+    };
+}
+
 /// Per-fluid coefficients for the cubic-SAFT family.
 struct CubicSAFTCoeffs {
     std::string name;
     double m = 1.0;                  ///< segment number (mi); m=1 reduces to CPA
     double a0i = -1;                 ///< Pa * m^6 / mol^2; monomer attraction at Tr=1
     double bi  = -1;                 ///< m^3 / mol; monomer covolume (b_0, T-independent input)
-    double c1  = -1;                 ///< Soave alpha-function prefactor (kappa_alpha)
+    double c1  = -1;                 ///< Soave alpha-function prefactor (kappa_alpha); ignored under alpha_beta_scheme != None
     double Tc  = -1;                 ///< K; critical temperature
+    double MW  = -1;                 ///< g/mol; required when alpha_beta_scheme != None
+    double volume_shift = 0.0;       ///< Péneloux volume shift, T-independent [m^3/mol]
     std::string BibTeXKey;
-    // Alajmi & Sisco (2022) T-dependent covolume parameters, CPC-SRK-b(T):
-    //   beta_T(T) = kappa_beta1 * exp(-kappa_beta2 * T_r)
-    //   b(T)      = bi * beta_T(T)
-    // Defaults (kappa_beta1=1, kappa_beta2=0) give beta_T=1 identically, so
-    // b(T) = bi (the existing T-independent behavior). When the user
-    // supplies non-default values, b is rescaled per call. MW correlations
-    // (Alajmi & Sisco Table 1) are:
-    //   kappa_alpha = 0.2425 * MW^0.2829
-    //   kappa_beta1 = 0.7112 * MW^0.1502
-    //   kappa_beta2 = 0.1549 * ln(MW) - 0.3224
-    double kappa_beta1 = 1.0;
-    double kappa_beta2 = 0.0;
     // Polar parameters (reuse SAFT conventions; zero -> not active). When any
     // polar parameter is set, epsilon_over_k must be supplied — there is no
     // sensible default for the polar T* reduction in a cubic framework.
@@ -135,12 +200,15 @@ private:
     const double R_gas;
 public:
     /// ``b0i`` is the T-independent covolume input (Alajmi-Sisco 2022's "b_0").
-    /// ``kappa_beta1``, ``kappa_beta2`` are the Alajmi-Sisco 2022 Eq. 11
-    /// T-dependent-b parameters:
+    /// ``c1`` is the Soave alpha-function prefactor (kappa_alpha): either
+    /// user-supplied (default scheme) or filled in by the umbrella from a
+    /// published correlation (e.g. Alajmi-Sisco 2022's kappa_alpha). 
+    /// ``kappa_beta1``, ``kappa_beta2`` are the covolume T-dependence parameters:
     ///     beta_T(T) = kappa_beta1 * exp(-kappa_beta2 * T_r),    T_r = T / T_C
     ///     b_i(T)    = b0_i * beta_T_i(T)
-    /// Defaults (kappa_beta1=1, kappa_beta2=0) give beta_T=1 identically
-    /// for the existing T-independent behavior.
+    /// Setting kappa_beta1=1, kappa_beta2=0 gives beta_T=1 identically (the
+    /// T-independent baseline). The umbrella class (CubicSAFTNonpolarMixture)
+    /// is responsible for filling these from the selected alpha_beta_scheme.
     CubicMonomer(CubicVariant variant,
                  const Eigen::ArrayXd& a0i,
                  const Eigen::ArrayXd& b0i,
@@ -253,9 +321,11 @@ public:
  * where b_mix(T) = sum_i x_i m_i b_i(T) is the segment-weighted T-dependent
  * covolume of the mixture and rho_molar is the *molecular* density.
  *
- * b_i(T) is Alajmi-Sisco 2022's CPC-SRK-b(T): b_i(T) = b0_i * kappa_beta1_i *
- * exp(-kappa_beta2_i * T/Tc_i). Defaults kappa_beta1=1, kappa_beta2=0 recover
- * the T-independent b0_i.
+ * b_i(T) follows the covolume T-dependence of the active alpha_beta scheme:
+ *     b_i(T) = b0_i * kappa_beta1_i * exp(-kappa_beta2_i * T/Tc_i)
+ * Setting kappa_beta1=1, kappa_beta2=0 recovers the T-independent b0_i (the
+ * "None" scheme). The umbrella (CubicSAFTNonpolarMixture) is responsible for
+ * filling these arrays from the selected alpha_beta_scheme.
  */
 class CubicChain {
 private:
@@ -389,17 +459,34 @@ public:
  * JC's collapsed kernels are only valid under the geometric assumption; the
  * arithmetic path falls back to full O(N\f$^2\f$) / O(N\f$^3\f$) sums.
  *
- * \par Alajmi-Sisco 2022 T-dependent covolume (optional)
- * When ``kappa_beta1`` or ``kappa_beta2`` are non-default on
- * ``CubicSAFTCoeffs``, the cubic monomer and chain layers use
- * \f$b_i(T) = b_{0,i} \cdot \kappa_{\beta 1,i} \exp(-\kappa_{\beta 2,i} T / T_{c,i})\f$
- * (Alajmi & Sisco 2022 Eq. 11) instead of the T-independent \f$b_{0,i}\f$.
- * The polar pair-distance \f$d_i(T)\f$ is recomputed per call from the same
- * \f$b_i(T)\f$. The association layer (when present) continues to use
- * \f$b_{0,i}\f$, matching the Alajmi-Sisco paper's scope.
+ * \par Alpha-beta scheme (optional T-dependence on both a and b)
+ * Selected at the mixture level via ``AlphaBetaScheme``. ``None`` (default)
+ * keeps Soave's alpha function with the user-supplied \f$\kappa_\alpha\f$
+ * (CubicSAFTCoeffs::c1) and a T-independent \f$b = b_0\f$.
  *
- * Defaults (``kappa_beta1 = 1``, ``kappa_beta2 = 0``) give \f$\beta_T \equiv 1\f$
- * and the existing T-independent behavior.
+ * ``AlajmiSisco2022`` is a *package deal*: the three constants
+ * \f$(\kappa_\alpha, \kappa_{\beta 1}, \kappa_{\beta 2})\f$ are all replaced by
+ * Alajmi-Sisco 2022 Table 1 MW correlations (see ::alajmi_kappa). Both the
+ * attraction and the covolume become temperature-dependent:
+ * \f[
+ *     a_i(T) = a_{0,i} \cdot \left[ 1 + \kappa_\alpha (1 - \sqrt{T/T_c}) \right]^2
+ * \f]
+ * \f[
+ *     b_i(T) = b_{0,i} \cdot \kappa_{\beta 1} \exp(-\kappa_{\beta 2} T / T_{c,i})
+ * \f]
+ * The user-supplied ``c1`` is ignored when this scheme is active. The polar
+ * pair-distance \f$d_i(T)\f$ is recomputed per call from \f$b_i(T)\f$. The
+ * association layer (when present) continues to use \f$b_{0,i}\f$. Requires ``MW`` to be set on each coeff.
+ * Currently SRK-only; PR-monomer raises until a PR-specific refit is published.
+ *
+ * \par Péneloux volume shift (optional)
+ * Per-species ``volume_shift`` \f$c_i\f$ (default 0) enables the textbook
+ * Péneloux (1982) translation. ``alphar`` evaluates all sub-terms (cubic,
+ * chain, polar) at the shifted density
+ * \f$\tilde\rho = \rho / (1 + \rho \bar c)\f$ and adds the closing
+ * \f$-\ln(1 + \rho \bar c)\f$ at the user's \f$\rho\f$. \f$c_i = 0\f$ for
+ * all species recovers the unshifted EOS bit-exactly. See
+ * peneloux_shift.hpp for the algebra and K-value invariance.
  */
 class CubicSAFTNonpolarMixture {
 public:
@@ -409,7 +496,8 @@ public:
 
 protected:
     Eigen::ArrayXd m_segments, bi, Tc, kappa_beta1, kappa_beta2,
-                   sigma_Angstrom, epsilon_over_k;
+                   sigma_Angstrom, epsilon_over_k,
+                   volume_shift;   ///< Péneloux T-independent volume shift per species [m^3/mol] (zero by default)
     std::vector<std::string> names, bibtex;
     CubicMonomer monomer;
     CubicChain   chain;
@@ -425,9 +513,7 @@ protected:
     /// derived from b = 4 V_molecular = (2 pi / 3) d^3. This is *different*
     /// from the SAFT segment-volume relation sigma = (6 b / (pi N_A))^{1/3}
     /// by a factor of 4^{1/3} ~ 1.587; the AM 2024 d is the physically
-    /// correct hard-sphere diameter for a vdW-style covolume. Using the
-    /// SAFT formula here would over-estimate d by ~58.7 %, distorting the
-    /// polar pair integral.
+    /// correct hard-sphere diameter for a vdW-style covolume.
     ///
     /// In Angstrom with b_i in m^3/mol: d[A] = (3 b / (2 pi N_A))^{1/3} * 1e10
     static Eigen::ArrayXd sigma_from_b(const Eigen::ArrayXd& bi) {
@@ -448,7 +534,9 @@ private:
         return out;
     }
 
-    static void validate_coeffs(const std::vector<CubicSAFTCoeffs>& cs) {
+    static void validate_coeffs(const std::vector<CubicSAFTCoeffs>& cs,
+                                 AlphaBetaScheme scheme) {
+        const bool need_MW = (scheme != AlphaBetaScheme::None);
         for (const auto& c : cs) {
             if (c.a0i <= 0 || c.bi <= 0) {
                 throw teqp::InvalidArgument(
@@ -458,51 +546,107 @@ private:
                 throw teqp::InvalidArgument(
                     "CubicSAFT: m must be positive for fluid " + c.name);
             }
+            if (need_MW && c.MW <= 0) {
+                throw teqp::InvalidArgument(
+                    "CubicSAFT: MW must be positive when alpha_beta_scheme != 'none' "
+                    "for fluid " + c.name);
+            }
             bool polar_active = c.mustar2 != 0 || c.Qstar2 != 0;
             if (polar_active && c.epsilon_over_k <= 0) {
                 throw teqp::InvalidArgument(
                     "CubicSAFT: epsilon_over_k must be supplied (positive) when "
                     "polar or quadrupolar parameters are set for fluid " + c.name);
             }
+            if (c.volume_shift >= c.bi) {
+                throw teqp::InvalidArgument(
+                    "CubicSAFT: volume_shift (" + std::to_string(c.volume_shift)
+                    + " m^3/mol) must be strictly less than bi ("
+                    + std::to_string(c.bi) + " m^3/mol) for fluid " + c.name
+                    + ". The Peneloux-translated covolume b_t = bi - "
+                    "volume_shift would be non-positive, indicating the "
+                    "cubic critical properties (Tc, Pc) give a covolume "
+                    "incompatible with the target density. Recalibrate Tc/Pc "
+                    "for this species or accept zero shift.");
+            }
         }
     }
 
-    /// Helper that runs validation as a side effect and returns the coeffs
-    /// unchanged. Used as the first member-init expression so that all
-    /// downstream member constructions see validated input.
-    static const std::vector<CubicSAFTCoeffs>& validated(const std::vector<CubicSAFTCoeffs>& cs) {
-        validate_coeffs(cs);
-        return cs;
+    /// Resolved per-species (c1, kappa_beta1, kappa_beta2) arrays for the
+    /// active scheme. ``None`` keeps the user-supplied c1 with (1, 0)
+    /// covolume; Alajmi overwrites all three from MW correlations.
+    struct ResolvedAlphaBeta {
+        Eigen::ArrayXd c1, kappa_beta1, kappa_beta2;
+    };
+
+    /// Validate inputs and resolve (c1, kappa_beta1, kappa_beta2) from the
+    /// active scheme in a single pass. Throws InvalidArgument on bad input.
+    static ResolvedAlphaBeta validate_and_resolve(const std::vector<CubicSAFTCoeffs>& cs,
+                                                    AlphaBetaScheme scheme,
+                                                    CubicVariant variant) {
+        validate_coeffs(cs, scheme);
+        const Eigen::Index N = static_cast<Eigen::Index>(cs.size());
+        ResolvedAlphaBeta out{Eigen::ArrayXd(N), Eigen::ArrayXd(N), Eigen::ArrayXd(N)};
+        if (scheme == AlphaBetaScheme::None) {
+            for (Eigen::Index i = 0; i < N; ++i) {
+                out.c1[i]          = cs[i].c1;
+                out.kappa_beta1[i] = 1.0;
+                out.kappa_beta2[i] = 0.0;
+            }
+        } else { // AlajmiSisco2022 — package deal: c1 is overwritten too.
+            for (Eigen::Index i = 0; i < N; ++i) {
+                auto k = alajmi_kappa(cs[i].MW, variant);
+                out.c1[i]          = k.kappa_alpha;
+                out.kappa_beta1[i] = k.kappa_beta1;
+                out.kappa_beta2[i] = k.kappa_beta2;
+            }
+        }
+        return out;
     }
 
 public:
     CubicSAFTNonpolarMixture(const std::vector<CubicSAFTCoeffs>& coeffs_in,
                               CubicVariant variant,
                               ChainRDF rdf,
+                              AlphaBetaScheme scheme,
                               double R_gas,
                               const std::optional<Eigen::ArrayXXd>& kmat = std::nullopt)
-      : m_segments(unpack(validated(coeffs_in), &CubicSAFTCoeffs::m)),
+      : CubicSAFTNonpolarMixture(coeffs_in, variant, rdf, R_gas, kmat,
+                                  validate_and_resolve(coeffs_in, scheme, variant))
+    {}
+
+private:
+    /// Delegated constructor that consumes the resolved (c1, kappa_beta)
+    /// arrays. validate_and_resolve runs before any member-init via the
+    /// public constructor's delegate-target call.
+    CubicSAFTNonpolarMixture(const std::vector<CubicSAFTCoeffs>& coeffs_in,
+                              CubicVariant variant,
+                              ChainRDF rdf,
+                              double R_gas,
+                              const std::optional<Eigen::ArrayXXd>& kmat,
+                              ResolvedAlphaBeta ab)
+      : m_segments(unpack(coeffs_in, &CubicSAFTCoeffs::m)),
         bi(unpack(coeffs_in, &CubicSAFTCoeffs::bi)),  // b0i (T-independent input)
         Tc(unpack(coeffs_in, &CubicSAFTCoeffs::Tc)),
-        kappa_beta1(unpack(coeffs_in, &CubicSAFTCoeffs::kappa_beta1)),
-        kappa_beta2(unpack(coeffs_in, &CubicSAFTCoeffs::kappa_beta2)),
+        kappa_beta1(ab.kappa_beta1),
+        kappa_beta2(ab.kappa_beta2),
         sigma_Angstrom(sigma_from_b(unpack(coeffs_in, &CubicSAFTCoeffs::bi))),  // T-independent reference (used as fallback when polar diameter doesn't need T)
         epsilon_over_k(unpack(coeffs_in, &CubicSAFTCoeffs::epsilon_over_k)),
+        volume_shift(unpack(coeffs_in, &CubicSAFTCoeffs::volume_shift)),
         monomer(CubicMonomer(
             variant,
             unpack(coeffs_in, &CubicSAFTCoeffs::a0i),
             unpack(coeffs_in, &CubicSAFTCoeffs::bi),
-            unpack(coeffs_in, &CubicSAFTCoeffs::c1),
+            ab.c1,
             unpack(coeffs_in, &CubicSAFTCoeffs::Tc),
-            unpack(coeffs_in, &CubicSAFTCoeffs::kappa_beta1),
-            unpack(coeffs_in, &CubicSAFTCoeffs::kappa_beta2),
+            ab.kappa_beta1,
+            ab.kappa_beta2,
             R_gas, kmat)),
         chain(CubicChain(
             unpack(coeffs_in, &CubicSAFTCoeffs::m),
             unpack(coeffs_in, &CubicSAFTCoeffs::bi),
             unpack(coeffs_in, &CubicSAFTCoeffs::Tc),
-            unpack(coeffs_in, &CubicSAFTCoeffs::kappa_beta1),
-            unpack(coeffs_in, &CubicSAFTCoeffs::kappa_beta2),
+            ab.kappa_beta1,
+            ab.kappa_beta2,
             rdf)),
         R_gas(R_gas)
     {
@@ -551,14 +695,48 @@ public:
         }
     }
 
+public:
     template<class VecType>
     auto R(const VecType& /*molefrac*/) const { return R_gas; }
 
-    /// b_mix passthrough used by GenericSAFT::get_bmix when this is the
-    /// nonpolar arm.
+    /**
+     * \brief Translated mixture covolume seen by the density solver.
+     *
+     * \details Returns the Péneloux-translated covolume
+     * \f$b_{t,\text{mix}} = b_{o,\text{mix}} - \bar c\f$, with the two
+     * terms following *different* mixing rules:
+     *   - \f$b_{o,\text{mix}} = \sum_i x_i m_i b_{o,i}\f$:
+     *     Sisco 2023 CPC chain-mixing (a per-segment physics derivation).
+     *   - \f$\bar c = \sum_i x_i c_i\f$:
+     *     Palma 2018 Eq. 3 linear-in-x (a per-molecule empirical
+     *     correction, matching the PC-SAFT convention).
+     *
+     * Identical to the unshifted case for pure species and for any \f$m=1\f$
+     * mixture (the CPA limit). For \f$m>1\f$ mixtures the rules diverge.
+     *
+     * This is what scales the density solver's iteration variable
+     * \f$\eta_\text{solver} = b_{t,\text{mix}} \rho_\text{shifted}\f$,
+     * so the cap \f$\eta < 1\f$ maps to the physical hard-sphere wall of
+     * the *translated* EOS (Jaubert 2016: the translated covolume \f$b_t\f$
+     * is the "true" covolume of the translated EOS; \f$b_o\f$ has no
+     * special role in the shifted state). See peneloux_shift.hpp for the
+     * \f$\alpha^r\f$ algebra and the cancellation that yields
+     * \f$-\ln(1 - b_t \rho_s)\f$ in the translated frame.
+     *
+     * Internal callers (the polar \f$\eta = \tilde\rho \, b / 4\f$ in
+     * ``alphar``, and the AM 2024 diameter
+     * \f$d_i = (3 b_i / (2 \pi N_A))^{1/3}\f$) keep using the
+     * untranslated \f$b_{o,i}\f$ via the per-species ``bi`` field.
+     */
     template<typename VecType>
-    double get_bmix(double T, const VecType& mole_fractions) const {
-        return chain.get_bmix(T, mole_fractions);
+    double get_bmix(double /*T*/, const VecType& mole_fractions) const {
+        double b_o_mix = 0.0;
+        double cbar    = 0.0;
+        for (Eigen::Index i = 0; i < m_segments.size(); ++i) {
+            b_o_mix += mole_fractions[i] * m_segments[i] * bi[i];
+            cbar    += mole_fractions[i] * volume_shift[i];
+        }
+        return b_o_mix - cbar;
     }
 
     /// Coarse model-family tag. Cubic-SAFT identifies as SAFT-family because
@@ -574,59 +752,54 @@ public:
     auto get_names() const { return names; }
     auto get_BibTeXKeys() const { return bibtex; }
 
-    /// alpha^r = mbar * a^cubic_monomer(T, rho_seg, x_seg) + a_chain(rho_mol, x)
-    ///           + a_polar(T, rho_A3, eta, x)  [optional]
+    /// \brief Residual molar Helmholtz energy (Sisco 2023 Eq. 6, with
+    /// optional Péneloux translation).
+    ///
+    /// \f$\alpha^r = \bar m \, a^\text{cubic}_\text{monomer}
+    /// + a_\text{chain} + a_\text{polar} - \ln(1 + \rho \bar c)\f$,
+    /// with all sub-terms evaluated at the shifted density
+    /// \f$\tilde\rho = \rho / (1 + \rho \bar c)\f$.
     template<typename TType, typename RhoType, typename VecType>
     auto alphar(const TType& T, const RhoType& rho_molar, const VecType& mole_fractions) const {
-        // mbar = sum_i x_i m_i
+        auto rho_tilde = teqp::peneloux::shifted_density(
+            rho_molar, mole_fractions, volume_shift);
+
+        // mbar = sum_i x_i m_i; segment-basis composition x_seg,i = x_i m_i / mbar
+        // feeds Sisco's per-segment cubic mixing rules.
         using sum_t = std::common_type_t<TType, RhoType, decltype(mole_fractions[0])>;
         sum_t mbar = 0.0;
         for (Eigen::Index i = 0; i < m_segments.size(); ++i) {
             mbar += mole_fractions[i] * m_segments[i];
         }
-
-        // Segment-basis composition: x_seg,i = (x_i m_i) / mbar
-        // Used in the cubic mixing rules so that A = sum_ij x_seg,i x_seg,j a_ij
-        // gives the segment-pair-averaged attraction.
         Eigen::Array<sum_t, Eigen::Dynamic, 1> x_seg(m_segments.size());
         for (Eigen::Index i = 0; i < m_segments.size(); ++i) {
             x_seg[i] = (mole_fractions[i] * m_segments[i]) / mbar;
         }
+        auto rho_seg = forceeval(mbar * rho_tilde);
 
-        // Segment density rho_seg = mbar * rho_molar
-        auto rho_seg = forceeval(mbar * rho_molar);
-
-        // 1. Cubic contribution (Sisco Eq. 11) multiplied by mbar (Sisco Eq. 6).
+        // 1. Cubic (Sisco Eq. 11) scaled by mbar (Sisco Eq. 6).
         auto a_cubic = monomer.alphar_Sisco_Eq11(T, rho_seg, x_seg, mbar);
         auto alphar = forceeval(mbar * a_cubic);
 
-        // 2. SAFT chain term.
-        alphar += chain.alphar(T, rho_molar, mole_fractions);
+        // 2. SAFT chain.
+        alphar += chain.alphar(T, rho_tilde, mole_fractions);
 
-        // 3. Optional polar / quadrupolar terms. They take (T, rho_A3, eta, x).
-        // We compute eta and rho_A3 from the chain layer's b_mix(T) and rho_molar.
+        // 3. Optional polar / quadrupolar; eta and rho_A3 share the chain's
+        // packing fraction (all derived from rho_tilde).
         if (dipolar || dipolar_jc || quadrupolar) {
-            // Use the chain layer's eta (rho * b_mix(T) / 4) so the polar term
-            // sees the same packing fraction as the chain term. With Alajmi-
-            // Sisco T-dependent b, b_mix is also T-dependent.
             auto b_mix = chain.bmix(T, mole_fractions);
-            auto eta = forceeval((rho_molar / 4.0) * b_mix);
-            auto rho_A3 = forceeval(rho_molar * N_A * 1e-30);
+            auto eta = forceeval((rho_tilde / 4.0) * b_mix);
+            auto rho_A3 = forceeval(rho_tilde * N_A * 1e-30);
 
             if (dipolar) {
                 alphar += dipolar.value().eval(T, rho_A3, eta, mole_fractions).alpha;
             }
             if (dipolar_jc) {
-                // JC takes the diameter as a per-call argument. For cubic-SAFT,
-                // d(T) = (3 b(T) / (2 pi N_A))^(1/3) (AM 2024). When kappa_beta
-                // defaults are used (1, 0), b(T) = b0 and d(T) reduces to the
-                // T-independent sigma_Angstrom computed at construction.
+                // JC requires per-call diameter; AM 2024 Eq. 14:
+                // d_i [A] = (3 b_i(T) / (2 pi N_A))^(1/3) * 1e10.
                 auto b_vec_T = chain.get_b_vector(T);
                 using d_t = std::decay_t<decltype(b_vec_T[0])>;
                 Eigen::ArrayX<d_t> d_T(b_vec_T.size());
-                // d_i [Angstrom] = (3 b_i / (2 pi N_A))^{1/3} * 1e10  with b in m^3/mol.
-                // Use pow with 1.0/3.0 so the call resolves correctly for both
-                // double and autodiff scalar types.
                 const double prefactor_third = 3.0 / (2.0 * EIGEN_PI * N_A);
                 for (Eigen::Index i = 0; i < b_vec_T.size(); ++i) {
                     d_T[i] = pow(prefactor_third * b_vec_T[i], 1.0/3.0) * 1e10;
@@ -638,6 +811,10 @@ public:
             }
         }
 
+        // 4. Péneloux closing correction (zero by default).
+        alphar += teqp::peneloux::log_correction(
+            rho_molar, mole_fractions, volume_shift);
+
         return forceeval(alphar);
     }
 };
@@ -647,7 +824,8 @@ public:
 /// Expected JSON shape:
 ///   {
 ///     "cubic": "PR" | "SRK",
-///     "radial_dist": "Elliott" | "CS",       // optional, default "Elliott"
+///     "radial_dist": "Elliott" | "CS",          // optional, default "Elliott"
+///     "alpha_beta_scheme": "none" | "alajmi-2022",  // optional, default "none"
 ///     "R_gas / J/mol/K": 8.314...,
 ///     "kmat": [[...]],                          // optional, NxN
 ///     "coeffs": [
@@ -656,8 +834,10 @@ public:
 ///         "m": 1.0,
 ///         "a0i / Pa m^6/mol^2": ...,
 ///         "bi / m^3/mol": ...,
-///         "c1": ...,
+///         "c1": ...,                              // ignored when alpha_beta_scheme != "none"
 ///         "Tc / K": ...,
+///         "MW / g/mol": ...,                      // required when alpha_beta_scheme != "none"
+///         "volume_shift / m^3/mol": ...,          // optional, default 0 (Péneloux T-independent shift)
 ///         "BibTeXKey": "...",
 ///         "(mu^*)^2": ...,    // optional polar
 ///         "nmu": ...,
@@ -668,11 +848,19 @@ public:
 ///       ...
 ///     ]
 ///   }
+///
+/// When ``alpha_beta_scheme = "alajmi-2022"`` the user-supplied ``c1`` is
+/// overwritten by Alajmi-Sisco 2022's MW correlation for kappa_alpha (along
+/// with the kappa_beta covolume T-dependence). See ::alajmi_kappa.
 inline auto CubicSAFTfactory(const nlohmann::json& spec) {
     CubicVariant variant = parse_cubic_variant(spec.at("cubic"));
     ChainRDF rdf = ChainRDF::Elliott;
     if (spec.contains("radial_dist")) {
         rdf = parse_chain_rdf(spec.at("radial_dist"));
+    }
+    AlphaBetaScheme scheme = AlphaBetaScheme::None;
+    if (spec.contains("alpha_beta_scheme")) {
+        scheme = parse_alpha_beta_scheme(spec.at("alpha_beta_scheme"));
     }
     double R_gas = spec.at("R_gas / J/mol/K");
 
@@ -685,11 +873,9 @@ inline auto CubicSAFTfactory(const nlohmann::json& spec) {
         c.bi   = j.at("bi / m^3/mol");
         c.c1   = j.at("c1");
         c.Tc   = j.at("Tc / K");
+        if (j.contains("MW / g/mol")) c.MW = j.at("MW / g/mol");
+        if (j.contains("volume_shift / m^3/mol")) c.volume_shift = j.at("volume_shift / m^3/mol");
         c.BibTeXKey = j.value("BibTeXKey", std::string{});
-        // Alajmi-Sisco 2022 T-dependent covolume parameters (optional).
-        // Defaults kappa_beta1=1, kappa_beta2=0 give beta_T=1 (T-independent b).
-        if (j.contains("kappa_beta1")) c.kappa_beta1 = j.at("kappa_beta1");
-        if (j.contains("kappa_beta2")) c.kappa_beta2 = j.at("kappa_beta2");
         if (j.contains("epsilon_over_k")) c.epsilon_over_k = j.at("epsilon_over_k");
         if (j.contains("(mu^*)^2")) c.mustar2 = j.at("(mu^*)^2");
         if (j.contains("nmu"))      c.nmu     = j.at("nmu");
@@ -715,7 +901,7 @@ inline auto CubicSAFTfactory(const nlohmann::json& spec) {
         kmat = km;
     }
 
-    return CubicSAFTNonpolarMixture(coeffs, variant, rdf, R_gas, kmat);
+    return CubicSAFTNonpolarMixture(coeffs, variant, rdf, scheme, R_gas, kmat);
 }
 
 }  // namespace teqp::saft::cubicsaft

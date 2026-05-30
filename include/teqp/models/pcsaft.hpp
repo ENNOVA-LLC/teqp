@@ -15,6 +15,7 @@
 #include "teqp/models/saft/polar_terms/GrossVrabec.hpp"
 #include "teqp/models/saft/polar_terms/JogChapman.hpp"
 #include "teqp/models/saft/segment_diameter.hpp"
+#include "teqp/models/saft/peneloux_shift.hpp"
 #include "teqp/cpp/model_kind.hpp"
 #include <optional>
 
@@ -47,6 +48,7 @@ struct SAFTCoeffs {
            xp = 0, ///< fraction of dipolar segments on the chain (Jog-Chapman convention; xp = nmu/m for consistency)
            Qstar2 = 0, ///< non-dimensional, the reduced quadrupole squared
            nQ = 0; ///< number of quadrupolar segments
+    double volume_shift = 0; ///< Péneloux T-independent volume shift [m^3/mol]; default 0 (unshifted). See PCSAFTMixture::alphar.
 };
 
 /// Manager class for PCSAFT coefficients
@@ -381,7 +383,8 @@ protected:
     Eigen::ArrayX<double> m, ///< number of segments
         mminus1, ///< m-1
         sigma_Angstrom, ///<
-        epsilon_over_k; ///< depth of pair potential divided by Boltzman constant
+        epsilon_over_k, ///< depth of pair potential divided by Boltzmann constant
+        volume_shift; ///< per-species Péneloux T-independent volume shift [m^3/mol]; zero by default
     std::vector<std::string> names, bibtex;
     Eigen::ArrayXXd kmat; ///< binary interaction parameter matrix
     PolarModel polar_model = PolarModel::GrossVrabec;
@@ -419,6 +422,7 @@ protected:
         mminus1.resize(coeffs.size());
         sigma_Angstrom.resize(coeffs.size());
         epsilon_over_k.resize(coeffs.size());
+        volume_shift.resize(coeffs.size());
         names.resize(coeffs.size());
         bibtex.resize(coeffs.size());
         auto i = 0;
@@ -427,6 +431,7 @@ protected:
             mminus1[i] = m[i] - 1;
             sigma_Angstrom[i] = coeff.sigma_Angstrom;
             epsilon_over_k[i] = coeff.epsilon_over_k;
+            volume_shift[i] = coeff.volume_shift;
             names[i] = coeff.name;
             bibtex[i] = coeff.BibTeXKey;
             i++;
@@ -617,24 +622,40 @@ public:
         return teqp::cppinterface::ModelKind::SAFT;
     }
 
+    /**
+     * \brief Residual molar Helmholtz energy with Péneloux volume translation.
+     *
+     * \details Per Moine et al. 2019 (I-PC-SAFT) and Palma et al. 2018, the
+     * user-supplied ``rhomolar`` is the *shifted* (observable) molar
+     * density. The unshifted PC-SAFT terms (hardchain, dispersion, polar,
+     * quadrupolar) are evaluated at the shifted density
+     * \f$\tilde\rho = \rho / (1 + \rho \bar c)\f$ with
+     * \f$\bar c = \sum_i x_i c_i\f$ (Palma 2018 Eq. 3, linear-in-x), then
+     * closed with \f$-\ln(1 + \rho \bar c)\f$ at the user's \f$\rho\f$.
+     * Unlike cubic-SAFT, PC-SAFT has no explicit covolume \f$b\f$, so no
+     * \f$b_t = b_o - c\f$ analogue is needed; \f$m\f$, \f$\sigma\f$, and
+     * \f$\epsilon/k\f$ are unchanged by the translation. When every
+     * species has \f$c_i = 0\f$ (default), this reduces bit-exactly to the
+     * unshifted PC-SAFT. See peneloux_shift.hpp.
+     */
     template<typename TTYPE, typename RhoType, typename VecType>
     auto alphar(const TTYPE& T, const RhoType& rhomolar, const VecType& mole_fractions) const {
-        // First values for the chain with dispersion (always included)
-        auto vals = hardchain.eval(T, rhomolar, mole_fractions);
+        // Péneloux: evaluate sub-terms at rho_tilde, close with -ln(1+rho*cbar).
+        auto rho_tilde = teqp::peneloux::shifted_density(
+            rhomolar, mole_fractions, volume_shift);
+
+        // First values for the chain with dispersion (always included).
+        auto vals = hardchain.eval(T, rho_tilde, mole_fractions);
         auto alphar = forceeval(vals.alphar_hc + vals.alphar_disp);
-        
-        auto rho_A3 = forceeval(rhomolar*N_A*1e-30);
+
+        auto rho_A3 = forceeval(rho_tilde*N_A*1e-30);
         // GV dipolar (active when polar_model == GrossVrabec)
         if (dipolar){
             auto valsdip = dipolar.value().eval(T, rho_A3, vals.eta, mole_fractions);
             alphar += valsdip.alpha;
         }
-        // JC dipolar (active when polar_model == JogChapman); mutually exclusive with `dipolar`.
-        // JC's polar pair integral uses the Chen-Kreglewski temperature-dependent
-        // segment diameter d_i(T) = sigma_i * (1 - 0.12 * exp(-3 eps_i/(k_B T))).
-        // The JC class itself does not apply this correction (the caller is
-        // responsible for whatever diameter convention is appropriate; see
-        // JogChapman.hpp). Here we compute the standard CK d(T) and pass it.
+        // JC dipolar: pass the CK temperature-dependent diameter explicitly
+        // (JogChapman.hpp requires the caller to supply d).
         if (dipolar_jc){
             auto d_Angstrom = teqp::saft::chen_kreglewski_d(T, sigma_Angstrom, epsilon_over_k);
             auto valsdip = dipolar_jc.value().eval(T, rho_A3, vals.eta, mole_fractions, d_Angstrom);
@@ -645,6 +666,11 @@ public:
             auto valsquad = quadrupolar.value().eval(T, rho_A3, vals.eta, mole_fractions);
             alphar += valsquad.alpha;
         }
+
+        // Péneloux closing correction (zero by default).
+        alphar += teqp::peneloux::log_correction(
+            rhomolar, mole_fractions, volume_shift);
+
         return forceeval(alphar);
     }
 };
@@ -796,6 +822,9 @@ inline auto PCSAFTfactory(const nlohmann::json& spec) {
             if (j.contains("(Q^*)^2") && j.contains("nQ")){
                 c.Qstar2 = j.at("(Q^*)^2");
                 c.nQ = j.at("nQ");
+            }
+            if (j.contains("volume_shift / m^3/mol")){
+                c.volume_shift = j.at("volume_shift / m^3/mol");
             }
             coeffs.push_back(c);
         }
