@@ -469,19 +469,19 @@ protected:
      *        coefficient table.
      *
      * \details The PCSAFT JSON schema carries the dipole as the reduced
-     * dimensionless ``(mu^*)^2`` from Gross-Vrabec 2006 (shared input
-     * across teqp's polar layers):
+     * dimensionless ``(mu^*)^2`` in the Gross-Vrabec 2006 convention
+     * (shared input across teqp's polar layers):
      * \f[
-     *    (\mu^*)^2 = \frac{\mu^2}{4 \pi \epsilon_0 \, m \, (\epsilon/k_B) \, k_B \, \sigma^3}
+     *    (\mu^*)^2 = \frac{\mu_{GV}^2}{4 \pi \epsilon_0 \, m \, (\epsilon/k_B) \, k_B \, \sigma^3}
      * \f]
-     * with \f$\epsilon/k_B\f$ in K, \f$\sigma\f$ in m, and \f$\mu\f$ in C·m.
-     * The published JC kernel works in raw \f$\mu^2\f$ (C\f$^2\f$·m\f$^2\f$),
-     * so we invert the reduction here once at construction:
+     * where \f$\mu_{GV}^2 = m \, \mu_{JC}^2\f$ relates the GV per-molecule
+     * dipole to JC's per-segment dipole. The JC kernel works in
+     * per-segment \f$\mu_{JC,SI}^2\f$, so the factory inverts the
+     * reduction and divides out the extra factor of \f$m\f$:
      * \f[
-     *    \mu_{SI}^2 = (\mu^*)^2 \cdot 4 \pi \epsilon_0 \, m \, (\epsilon/k_B) \, k_B \, \sigma^3
+     *    \mu_{JC,SI}^2 = (\mu^*)^2 \cdot 4 \pi \epsilon_0 \, (\epsilon/k_B) \, k_B \, \sigma^3.
      * \f]
-     * (single \f$k_B\f$, not \f$k_B^2\f$, because \f$\epsilon/k_B\f$ is the
-     * dimensionless input).
+     * (single \f$k_B\f$, not \f$k_B^2\f$, because \f$\epsilon/k_B\f$ is the dimensionless input.)
      *
      * The polar-segment fraction ``xp`` falls back to ``nmu/m`` when not
      * supplied directly; see ``docs/eos/polar_theory_mapping.md`` for the
@@ -508,8 +508,10 @@ protected:
         for (Eigen::Index k = 0; k < (Eigen::Index)coeffs.size(); ++k) {
             const double sigma_m = sigma_Angstrom[k] * 1e-10;
             const double sigma3 = sigma_m * sigma_m * sigma_m;
-            // Invert teqp's (mu*)^2 reduction; see docstring above.
-            mu_squared_SI[k] = mustar2[k] * FOUR_PI_EPS0 * m[k] * epsilon_over_k[k]
+            // Invert teqp's GV-convention (mu*)^2 reduction AND drop the
+            // extra factor of m so the JC kernel receives its native
+            // per-segment mu_JC^2 (= alpha_p/(m*xp)); see docstring above.
+            mu_squared_SI[k] = mustar2[k] * FOUR_PI_EPS0 * epsilon_over_k[k]
                                 * K_B * sigma3;
         }
         return PCSAFTDipolarContributionJC(m, xp, mu_squared_SI, polar_sigmaij_rule);

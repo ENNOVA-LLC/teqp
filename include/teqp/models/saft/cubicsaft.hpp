@@ -671,15 +671,16 @@ private:
         const auto polar_sigmaij = teqp::saft::polar_terms::SigmaijRule::geometric;
 
         if ((mustar2.abs() * xp.abs()).sum() > 0) {
-            // Invert teqp's (mu*)^2 reduction to recover raw mu^2 in SI for JC.
-            // See PCSAFTMixture::build_dipolar_jc docstring for the formula.
+            // Convert the shared GV-convention (mu*)^2 input to the
+            // per-segment mu_JC^2 in SI that the JC kernel consumes. See
+            // PCSAFTMixture::build_dipolar_jc docstring for the formula.
             constexpr double FOUR_PI_EPS0 = 1.11265005605362e-10;
             constexpr double K_B = 1.380649e-23;
             Eigen::ArrayXd mu_squared_SI(mustar2.size());
             for (Eigen::Index k = 0; k < mustar2.size(); ++k) {
                 const double sigma_m = sigma_Angstrom[k] * 1e-10;
                 const double sigma3 = sigma_m * sigma_m * sigma_m;
-                mu_squared_SI[k] = mustar2[k] * FOUR_PI_EPS0 * m_segments[k]
+                mu_squared_SI[k] = mustar2[k] * FOUR_PI_EPS0
                                     * epsilon_over_k[k] * K_B * sigma3;
             }
             dipolar_jc.emplace(DipolarJC(m_segments, xp, mu_squared_SI));
@@ -852,6 +853,11 @@ public:
 /// When ``alpha_beta_scheme = "alajmi-2022"`` the user-supplied ``c1`` is
 /// overwritten by Alajmi-Sisco 2022's MW correlation for kappa_alpha (along
 /// with the kappa_beta covolume T-dependence). See ::alajmi_kappa.
+///
+/// The ``MW / g/mol`` field is the value the active MW-driven scheme will
+/// see as input. For non-polymer species this is the molecular molar mass.
+/// For polymer species the caller is responsible for supplying the *monomer*
+/// (repeat-unit) molar mass instead.
 inline auto CubicSAFTfactory(const nlohmann::json& spec) {
     CubicVariant variant = parse_cubic_variant(spec.at("cubic"));
     ChainRDF rdf = ChainRDF::Elliott;
