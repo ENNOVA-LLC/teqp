@@ -10,7 +10,10 @@ enable_testing()
 if (MSVC)
     add_compile_options(/bigobj)
     add_compile_options(/permissive-)
-    # set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /MP")
+    # NOTE: /arch:AVX2 was TRIED (2026-06-17) and REVERTED because it made the
+    # composition Hessian ~7% SLOWER (verified, min-of-trials).
+    # teqp's autodiff Hessian is dominated by dependent scalar Dual operations
+    # that don't auto-vectorize.
 endif()
 
 get_property(isMultiConfig GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)

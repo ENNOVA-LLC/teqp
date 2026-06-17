@@ -21,12 +21,14 @@ enum class radial_dists {
     CS,     ///< Carnahan-Starling at mixture eta built from T-independent sigma; cheap, used by CPA-style models.
     KG,     ///< Kontogeorgis form g = 1 / (1 - 1.9 eta); also from sigma.
     BMCSL,  ///< Boublik-Mansoori-Carnahan-Starling-Leland pair-specific g_ij(d_i(T), d_j(T)); the Gross-Sadowski 2002 PC-SAFT-association choice and feos's choice. Requires per-species (m, sigma, epsilon/k) in the CanonicalData.
+    vonSolms, ///< von Solms 2003 simplified-SAFT contact value g^hs(eta) = (1 - eta/2)/(1-eta)^3 at the SINGLE segment packing fraction eta = (pi/6) rho sum_i x_i m_i d_i(T)^3 (== the hard-sphere term's zeta_3). Composition-independent pair structure; auto-selected by GenericSAFT when the nonpolar hard-sphere is the von Solms simplified form. Requires per-species (m, sigma, epsilon/k) like BMCSL.
 };
 
 inline auto get_radial_dist(const std::string& s) {
     if (s == "CS") { return radial_dists::CS; }
     else if (s == "KG") { return radial_dists::KG; }
     else if (s == "BMCSL") { return radial_dists::BMCSL; }
+    else if (s == "vonSolms" || s == "von-solms" || s == "simplified") { return radial_dists::vonSolms; }
     else {
         throw std::invalid_argument("bad radial_dist flag: " + s);
     }

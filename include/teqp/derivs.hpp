@@ -1040,7 +1040,11 @@ struct IsochoricDerivatives{
             auto molefrac = (rho_ / rhotot_).eval();
             return forceeval(model.alphar(T, rhotot_, molefrac) * model.R(molefrac) * T * rhotot_);
         };
-        return autodiff::hessian(hfunc, wrt(rhovecc), at(rhovecc), u, g).eval(); // evaluate the function value u, its gradient, and its Hessian matrix H
+        // Forward-namespace-qualified (autodiff::detail::) for robustness if a
+        // reverse-mode autodiff header is ever pulled into this TU (both layers
+        // re-export `hessian`/`wrt` into `autodiff::`, which would otherwise
+        // make these calls ambiguous).
+        return autodiff::detail::hessian(hfunc, autodiff::detail::wrt(rhovecc), autodiff::detail::at(rhovecc), u, g).eval();
     }
 
     /**
@@ -1061,7 +1065,7 @@ struct IsochoricDerivatives{
             return forceeval(model.alphar(T, rhotot_, molefrac) * model.R(molefrac) * T * rhotot_);
         };
         // Evaluate the function value u, its gradient, and its Hessian matrix H
-        Eigen::MatrixXd H = autodiff::hessian(hfunc, wrt(rhovecc), at(rhovecc), u, g); 
+        Eigen::MatrixXd H = autodiff::detail::hessian(hfunc, autodiff::detail::wrt(rhovecc), autodiff::detail::at(rhovecc), u, g); // qualified; see note in build_Psir_Hessian_autodiff
         // Remove autodiff stuff from the numerical values
         auto f = getbaseval(u);
         auto gg = g.cast<double>().eval();
@@ -1119,7 +1123,9 @@ struct IsochoricDerivatives{
             auto molefrac = (rho_ / rhotot_).eval();
             return forceeval(model.alphar(T, rhotot_, molefrac) * model.R(molefrac) * T * rhotot_);
         };
-        auto val = autodiff::gradient(psirfunc, wrt(rhovecc), at(rhovecc)).eval(); // evaluate the gradient
+        // Forward-namespace-qualified (autodiff::detail::) for robustness; see
+        // the note in build_Psir_Hessian_autodiff.
+        auto val = autodiff::detail::gradient(psirfunc, autodiff::detail::wrt(rhovecc), autodiff::detail::at(rhovecc)).eval();
         return val;
     }
 
@@ -1273,7 +1279,7 @@ struct IsochoricDerivatives{
                 return forceeval(model.alphar(T, rhotot_, molefrac) * model.R(molefrac) * T * rhotot_);
             };
             dual2nd Tdual = T, rhoidual = rho[i];
-            auto [u00, u10, u11] = derivatives(psirfunc, wrt(Tdual, rhoidual), at(Tdual, rhoidual));
+            auto [u00, u10, u11] = derivatives(psirfunc, autodiff::detail::wrt(Tdual, rhoidual), at(Tdual, rhoidual));
             deriv[i] = u11;
         }
         return deriv;
@@ -1289,7 +1295,7 @@ struct IsochoricDerivatives{
                 return forceeval(model.alphar(T, rho, molefracdual));
             };
             dual2nd rhodual = rhomolar, xidual = molefrac[i];
-            auto [u00, u10, u11] = derivatives(alpharfunc, wrt(rhodual, xidual), at(rhodual, xidual));
+            auto [u00, u10, u11] = derivatives(alpharfunc, autodiff::detail::wrt(rhodual, xidual), at(rhodual, xidual));
             deriv[i] = u11;
         }
         return deriv;

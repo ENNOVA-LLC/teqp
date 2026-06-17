@@ -239,9 +239,11 @@ public:
                 data.radial_dist = options.radial_dist;
                 // BMCSL needs per-species segment parameters (m, sigma, eps/k)
                 // so the Delta routine can build d_i(T) and the pair g_ij.
+                // vonSolms needs the same to build the single segment eta = zeta_3.
                 // CR1-WS also needs sigma_m for the geometric sigma^3 cross-term.
                 // (These are optional for CR1 + CS / KG which only use ``b`` and ``beta``.)
-                const bool need_segment_params = (data.radial_dist == radial_dists::BMCSL) || is_WS;
+                const bool need_segment_params = (data.radial_dist == radial_dists::BMCSL)
+                                                 || (data.radial_dist == radial_dists::vonSolms) || is_WS;
                 if (need_segment_params){
                     if (!(j.contains("m") && j.contains("sigma / m")
                           && (j.contains("epsilon/kB / K") || j.contains("epsilon / J/mol_segment")))){
@@ -316,6 +318,10 @@ public:
         using d_t = std::common_type_t<decltype(T), decltype(molefracs[0])>;
         using bmcsl_t = std::common_type_t<decltype(T), decltype(rhomolar), decltype(molefracs[0])>;
         std::optional<Eigen::Array<d_t, Eigen::Dynamic, 1>> d_T;
+        // von Solms single g^hs(eta): eta is built from the T-dependent CK
+        // diameter, so it carries T in its type (bmcsl_t), unlike the CS/KG
+        // ``g`` (eta_t, no T).
+        std::optional<bmcsl_t> g_vonsolms;
         std::optional<bmcsl_t> n2_BMCSL;
         std::optional<bmcsl_t> n3_BMCSL;
         // CR1 and CR1-WS share the same radial-distribution setup; they only
@@ -360,6 +366,27 @@ public:
                     d_T = std::move(d_arr);
                     n2_BMCSL = n2;
                     n3_BMCSL = n3;
+                    break;
+                }
+                case radial_dists::vonSolms: {
+                    // von Solms simplified contact value at the single segment
+                    // packing fraction eta = (pi/6) rho sum_i x_i m_i d_i^3
+                    // (identical to the hard-sphere term's zeta_3). One scalar
+                    // g^hs(eta) reused for every site pair — removes the
+                    // composition-dependence of the pair structure from Delta.
+                    using namespace teqp::constants;
+                    const auto N = molefracs.size();
+                    Eigen::Array<d_t, Eigen::Dynamic, 1> d_arr =
+                        teqp::saft::chen_kreglewski_d(T, d.sigma_m, d.epsilon_over_k_K);
+                    bmcsl_t eta = 0.0;
+                    const double PI_LOCAL = EIGEN_PI;
+                    for (auto i = 0; i < N; ++i){
+                        auto rho_seg_i = rhomolar * molefracs[i] * N_A * d.m_segments[i];
+                        auto d3 = d_arr[i]*d_arr[i]*d_arr[i];
+                        eta = eta + rho_seg_i * (PI_LOCAL/6.0) * d3;
+                    }
+                    auto oneeta = 1.0 - eta;
+                    g_vonsolms = forceeval((1.0 - eta/2.0) / (oneeta*oneeta*oneeta));
                     break;
                 }
                 default:
@@ -458,6 +485,11 @@ public:
                         auto k_ij = d_i*d_j / (d_i + d_j) * n2 * inv_1mn3;
                         auto g_ij = inv_1mn3 * (1.0 + k_ij/2.0 + k_ij*k_ij/18.0);
                         Delta(I, J) = g_ij*strength_vol*boltzmann_factor/N_A; // m^3
+                    }
+                    else if (d.radial_dist == radial_dists::vonSolms){
+                        // Single von Solms contact value g^hs(eta), same scalar
+                        // for every site pair (composition-independent structure).
+                        Delta(I, J) = g_vonsolms.value()*strength_vol*boltzmann_factor/N_A; // m^3
                     }
                     else {
                         Delta(I, J) = g.value()*strength_vol*boltzmann_factor/N_A; // m^3

@@ -167,6 +167,55 @@ auto gij_HS(const zVecType& zeta, const dVecType& d,
 }
 
 /**
+ \brief von Solms simplified-SAFT hard-sphere alphar (single average diameter)
+
+ von Solms, Michelsen & Kontogeorgis (IECR 2003,
+ https://doi.org/10.1021/ie020753p) replace the four-moment Boublik-Mansoori
+ hard-sphere term with the *pure-component* Carnahan-Starling form evaluated at
+ a single mixture-averaged packing fraction:
+ \f[
+    a^{hs} = \frac{4\eta - 3\eta^2}{(1-\eta)^2}
+ \f]
+ with \f$\eta = \zeta_3 = (\pi/6)\,\rho\,\bar d^3\f$ and the average diameter
+ defined by \f$\bar m\,\bar d^3 = \sum_i x_i m_i d_i^3\f$ (Eq. C.4). Unlike
+ :func:`get_alphar_hs`, this expression has no \f$1/\zeta_0\f$ or
+ \f$1/\zeta_3\f$ factors, so the \f$\rho\to 0\f$ limit (\f$a^{hs}\to 0\f$) and
+ all its derivatives are finite by construction — no Taylor-series guard is
+ needed for the autodiff tooling.
+
+ The modification is "usually negligible but non-negligible when the segment
+ numbers \f$m_i\f$ differ greatly between components" (von Solms §C); the
+ difference is absorbed into \f$k_{ij}\f$ in practice. Selected via the
+ ``hard_sphere = "simplified"`` field; see :class:`PCSAFTHardChainContribution`.
+*/
+template<typename EtaType>
+auto get_alphar_hs_simplified(const EtaType& eta) {
+    auto oneeta = forceeval(1.0 - eta);
+    return forceeval((4.0*eta - 3.0*eta*eta) / (oneeta*oneeta));
+}
+
+/**
+ \brief von Solms simplified-SAFT hard-sphere radial distribution function
+
+ The pure-component Carnahan-Starling contact value at the single averaged
+ packing fraction \f$\eta\f$ (von Solms 2003, Eq. C.5):
+ \f[
+    g^{hs}(\eta) = \frac{1 - \eta/2}{(1-\eta)^3}
+ \f]
+ This single scalar replaces the per-pair :func:`gij_HS` and is used by *every*
+ consumer of the hard-sphere \f$g\f$ in simplified mode — both the chain term
+ \f$\sum_i x_i (m_i-1)\ln g^{hs}\f$ here and the association strength
+ \f$\Delta^{A_iB_j}\f$ in the association layer — so the composition-dependence
+ of \f$g\f$ collapses consistently across the model. \f$g^{hs}\to 1\f$ as
+ \f$\rho\to 0\f$ with finite derivatives, so no limit guard is required.
+*/
+template<typename EtaType>
+auto get_gij_HS_simplified(const EtaType& eta) {
+    auto oneeta = forceeval(1.0 - eta);
+    return forceeval((1.0 - eta/2.0) / (oneeta*oneeta*oneeta));
+}
+
+/**
 Sum up three array-like objects that can each have different container types and value types
 */
 template<typename VecType1, typename NType>
@@ -187,6 +236,14 @@ auto sumproduct(const VecType1& v1, const VecType2& v2, const VecType3& v3) {
     return forceeval((v1.template cast<ResultType>().array() * v2.template cast<ResultType>().array() * v3.template cast<ResultType>().array()).sum());
 }
 
+/// Hard-sphere term selector for the hard-chain contribution.
+/// - ``Exact`` (default) is the four-moment Boublik-Mansoori a^hs (Eq. A.6)
+///   with the per-pair g_ij^hs (Eq. A.7) — stock PC-SAFT.
+/// - ``Simplified`` is the von Solms 2003 single-average-diameter form:
+///   Carnahan-Starling a^hs(eta) (Eq. C.6) and g^hs(eta) (Eq. C.5). The same
+///   simplified g^hs is reused by the association layer in this mode.
+enum class HardSphereVariant { Exact, Simplified };
+
 /***
  * \brief This class provides the evaluation of the hard chain contribution from classic PC-SAFT
  */
@@ -206,10 +263,14 @@ protected:
         ///< - ``geometric`` is the Marshall convention sqrt(sigma_i*sigma_j).
         ///< Pure-component results are unchanged; mixture results shift when
         ///< components have asymmetric size.
+    const HardSphereVariant hs_variant;
+        ///< Hard-sphere a^hs / g^hs form (exact Boublik-Mansoori vs von Solms
+        ///< simplified). Only the hard-CHAIN part of ``eval`` branches on this;
+        ///< the dispersion double sum is identical in both.
 
 public:
-    PCSAFTHardChainContribution(const Eigen::ArrayX<double> &m, const Eigen::ArrayX<double> &mminus1, const Eigen::ArrayX<double> &sigma_Angstrom, const Eigen::ArrayX<double> &epsilon_over_k, const Eigen::ArrayXXd &kmat, const Eigen::Array<double, 3, 7>&a, const Eigen::Array<double, 3,7>&b, teqp::saft::polar_terms::SigmaijRule sigmaij_rule = teqp::saft::polar_terms::SigmaijRule::arithmetic)
-    : m(m), mminus1(mminus1), sigma_Angstrom(sigma_Angstrom), epsilon_over_k(epsilon_over_k), kmat(kmat), a(a), b(b), sigmaij_rule(sigmaij_rule) {}
+    PCSAFTHardChainContribution(const Eigen::ArrayX<double> &m, const Eigen::ArrayX<double> &mminus1, const Eigen::ArrayX<double> &sigma_Angstrom, const Eigen::ArrayX<double> &epsilon_over_k, const Eigen::ArrayXXd &kmat, const Eigen::Array<double, 3, 7>&a, const Eigen::Array<double, 3,7>&b, teqp::saft::polar_terms::SigmaijRule sigmaij_rule = teqp::saft::polar_terms::SigmaijRule::arithmetic, HardSphereVariant hs_variant = HardSphereVariant::Exact)
+    : m(m), mminus1(mminus1), sigma_Angstrom(sigma_Angstrom), epsilon_over_k(epsilon_over_k), kmat(kmat), a(a), b(b), sigmaij_rule(sigmaij_rule), hs_variant(hs_variant) {}
 
     PCSAFTHardChainContribution& operator=( const PCSAFTHardChainContribution& ) = delete; // non copyable
 
@@ -325,13 +386,32 @@ public:
         auto I1 = (abar.array().template cast<decltype(eta)>()*etapowers).sum();
         auto I2 = (bbar.array().template cast<decltype(eta)>()*etapowers).sum();
         
-        // Hard chain contribution from G&S
+        // Hard chain contribution from G&S.
+        //
+        // Two forms, selected by hs_variant:
+        //  - Exact: four-moment Boublik-Mansoori a^hs (Eq. A.6) and per-pair
+        //    g_ii^hs (Eq. A.7).
+        //  - Simplified (von Solms 2003): Carnahan-Starling a^hs(eta)
+        //    and a SINGLE g^hs(eta) reused for every component.
+        //    Note eta == zeta[3] == (pi/6) rho sum_i x_i m_i d_i^3 is already
+        //    exactly the von Solms average-diameter packing fraction, so no
+        //    separate average diameter is computed. The chain sum collapses to
+        //    ln g^hs(eta) * sum_i x_i (m_i - 1) = ln g^hs(eta) * (mbar - 1).
         using tt = std::common_type_t<decltype(zeta[0]), decltype(d[0])>;
-        Eigen::ArrayX<tt> lngii_hs(mole_fractions.size());
-        for (auto i = 0; i < lngii_hs.size(); ++i) {
-            lngii_hs[i] = log(gij_HS(zeta, d, i, i));
+        TRHOType alphar_hc;
+        if (hs_variant == HardSphereVariant::Simplified) {
+            auto ln_g_hs = log(get_gij_HS_simplified(eta));
+            auto chain = forceeval((mole_fractions.template cast<TRHOType>().array()
+                                    * mminus1.template cast<TRHOType>().array()).sum() * ln_g_hs);
+            alphar_hc = forceeval(mbar * get_alphar_hs_simplified(eta) - chain); // Eq. C.6 + C.5
         }
-        auto alphar_hc = forceeval(mbar * get_alphar_hs(zeta, D) - sumproduct(mole_fractions, mminus1, lngii_hs)); // Eq. A.4
+        else {
+            Eigen::ArrayX<tt> lngii_hs(mole_fractions.size());
+            for (auto i = 0; i < lngii_hs.size(); ++i) {
+                lngii_hs[i] = log(gij_HS(zeta, d, i, i));
+            }
+            alphar_hc = forceeval(mbar * get_alphar_hs(zeta, D) - sumproduct(mole_fractions, mminus1, lngii_hs)); // Eq. A.4
+        }
         
         // Dispersive contribution
         auto C1_ = C1(eta, mbar);
@@ -391,9 +471,13 @@ protected:
     teqp::saft::polar_terms::SigmaijRule polar_sigmaij_rule = teqp::saft::polar_terms::SigmaijRule::arithmetic;
     teqp::saft::polar_terms::SigmaijRule nonpolar_sigmaij_rule = teqp::saft::polar_terms::SigmaijRule::arithmetic;
         ///< sigma_ij rule inside the non-polar dispersion double sum.
-        ///< - 'arithmetic' (default) preserves stock PC-SAFT behavior; 
+        ///< - 'arithmetic' (default) preserves stock PC-SAFT behavior;
         ///< - 'geometric' is the Marshall convention. Independent of polar_sigmaij_rule because
         ///< the two layers have different parameter calibrations.
+    HardSphereVariant hs_variant = HardSphereVariant::Exact;
+        ///< Hard-sphere a^hs / g^hs form (exact vs von Solms simplified).
+        ///< Declared BEFORE ``hardchain`` so it is initialized before
+        ///< ``build_hardchain`` reads it in the constructor init-list.
 
     PCSAFTHardChainContribution hardchain;
     std::optional<PCSAFTDipolarContribution> dipolar; // GV dipolar, can be present or not
@@ -436,7 +520,7 @@ protected:
             bibtex[i] = coeff.BibTeXKey;
             i++;
         }
-        return PCSAFTHardChainContribution(m, mminus1, sigma_Angstrom, epsilon_over_k, kmat, a, b, nonpolar_sigmaij_rule);
+        return PCSAFTHardChainContribution(m, mminus1, sigma_Angstrom, epsilon_over_k, kmat, a, b, nonpolar_sigmaij_rule, hs_variant);
     }
     auto extract_names(const std::vector<SAFTCoeffs> &coeffs){
         std::vector<std::string> names_;
@@ -560,19 +644,22 @@ public:
                   const Eigen::ArrayXXd& kmat = {},
                   PolarModel polar_model = PolarModel::GrossVrabec,
                   std::optional<teqp::saft::polar_terms::SigmaijRule> polar_sigmaij_rule = std::nullopt,
-                  teqp::saft::polar_terms::SigmaijRule nonpolar_sigmaij_rule = teqp::saft::polar_terms::SigmaijRule::arithmetic)
-        : PCSAFTMixture(get_coeffs_from_names(names), a, b, kmat, polar_model, polar_sigmaij_rule, nonpolar_sigmaij_rule){};
+                  teqp::saft::polar_terms::SigmaijRule nonpolar_sigmaij_rule = teqp::saft::polar_terms::SigmaijRule::arithmetic,
+                  HardSphereVariant hs_variant = HardSphereVariant::Exact)
+        : PCSAFTMixture(get_coeffs_from_names(names), a, b, kmat, polar_model, polar_sigmaij_rule, nonpolar_sigmaij_rule, hs_variant){};
     PCSAFTMixture(const std::vector<SAFTCoeffs> &coeffs,
                   const Eigen::Array<double, 3, 7>& a = teqp::saft::PCSAFT::PCSAFTMatrices::GrossSadowski2001::a,
                   const Eigen::Array<double, 3, 7>& b = teqp::saft::PCSAFT::PCSAFTMatrices::GrossSadowski2001::b,
                   const Eigen::ArrayXXd &kmat = {},
                   PolarModel polar_model = PolarModel::GrossVrabec,
                   std::optional<teqp::saft::polar_terms::SigmaijRule> polar_sigmaij_rule = std::nullopt,
-                  teqp::saft::polar_terms::SigmaijRule nonpolar_sigmaij_rule = teqp::saft::polar_terms::SigmaijRule::arithmetic)
+                  teqp::saft::polar_terms::SigmaijRule nonpolar_sigmaij_rule = teqp::saft::polar_terms::SigmaijRule::arithmetic,
+                  HardSphereVariant hs_variant = HardSphereVariant::Exact)
         : names(extract_names(coeffs)), kmat(kmat),
           polar_model(polar_model),
           polar_sigmaij_rule(resolve_polar_sigmaij_rule(polar_model, polar_sigmaij_rule)),
           nonpolar_sigmaij_rule(nonpolar_sigmaij_rule),
+          hs_variant(hs_variant),
           hardchain(build_hardchain(coeffs, a, b)),
           dipolar(build_dipolar(coeffs)),
           dipolar_jc(build_dipolar_jc(coeffs)),
@@ -587,6 +674,9 @@ public:
     auto get_kmat() const { return kmat; }
     auto get_names() const { return names;}
     auto get_BibTeXKeys() const { return bibtex;}
+    /// Hard-sphere variant (exact vs von Solms simplified). Read by
+    /// GenericSAFT to propagate the simplified g^hs into the association layer.
+    HardSphereVariant get_hard_sphere_variant() const { return hs_variant; }
 
     auto print_info() {
         std::string s = std::string("i m sigma / A e/kB / K \n  ++++++++++++++") + "\n";
@@ -751,12 +841,30 @@ inline auto PCSAFTfactory(const nlohmann::json& spec) {
         }
     }
 
+    // Optional hard-sphere term selector. Default "exact" reproduces stock
+    // PC-SAFT (four-moment Boublik-Mansoori a^hs + per-pair g_ij^hs).
+    // "simplified" activates the von Solms 2003 single-average-diameter form
+    // (Carnahan-Starling a^hs(eta) + scalar g^hs(eta)); the same simplified
+    // g^hs is also reused by the association layer (see GenericSAFT).
+    HardSphereVariant hs_variant = HardSphereVariant::Exact;
+    if (spec.contains("hard_sphere")) {
+        std::string hs = spec.at("hard_sphere");
+        if (hs == "exact" || hs == "Exact" || hs == "full") {
+            hs_variant = HardSphereVariant::Exact;
+        } else if (hs == "simplified" || hs == "Simplified" || hs == "von-solms" || hs == "vonSolms") {
+            hs_variant = HardSphereVariant::Simplified;
+        } else {
+            throw teqp::InvalidArgument("Don't know what to do with hard_sphere = " + hs
+                + " (expected 'exact' or 'simplified')");
+        }
+    }
+
     if (spec.contains("names")){
         std::vector<std::string> names = spec["names"];
         if (kmat && static_cast<std::size_t>(kmat.value().rows()) != names.size()){
             throw teqp::InvalidArgument("Provided length of names of " + std::to_string(names.size()) + " does not match the dimension of the kmat of " + std::to_string(kmat.value().rows()));
         }
-        return PCSAFTMixture(names, a, b, kmat.value_or(Eigen::ArrayXXd{}), polar_model, polar_sigmaij_rule, nonpolar_sigmaij_rule);
+        return PCSAFTMixture(names, a, b, kmat.value_or(Eigen::ArrayXXd{}), polar_model, polar_sigmaij_rule, nonpolar_sigmaij_rule, hs_variant);
     }
     else if (spec.contains("coeffs")){
         std::vector<SAFTCoeffs> coeffs;
@@ -833,7 +941,7 @@ inline auto PCSAFTfactory(const nlohmann::json& spec) {
         if (kmat && static_cast<std::size_t>(kmat.value().rows()) != coeffs.size()){
             throw teqp::InvalidArgument("Provided length of coeffs of " + std::to_string(coeffs.size()) + " does not match the dimension of the kmat of " + std::to_string(kmat.value().rows()));
         }
-        return PCSAFTMixture(coeffs, a, b, kmat.value_or(Eigen::ArrayXXd{}), polar_model, polar_sigmaij_rule, nonpolar_sigmaij_rule);
+        return PCSAFTMixture(coeffs, a, b, kmat.value_or(Eigen::ArrayXXd{}), polar_model, polar_sigmaij_rule, nonpolar_sigmaij_rule, hs_variant);
     }
     else{
         throw std::invalid_argument("you must provide names or coeffs, but not both");

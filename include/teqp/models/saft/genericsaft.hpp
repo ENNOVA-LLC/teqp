@@ -56,9 +56,38 @@ private:
     };
     
 public:
+    /// True when the nonpolar layer is a PC-SAFT mixture using the von Solms
+    /// simplified hard-sphere term. Used to propagate the simplified g^hs into
+    /// the association layer so a single toggle controls both.
+    bool nonpolar_is_vonsolms_hs() const {
+        return std::visit([](const auto& t) -> bool {
+            if constexpr (std::is_same_v<std::decay_t<decltype(t)>, saft::pcsaft::PCSAFTMixture>) {
+                return t.get_hard_sphere_variant() == saft::pcsaft::HardSphereVariant::Simplified;
+            } else {
+                return false;
+            }
+        }, nonpolar);
+    }
+
     GenericSAFT(const nlohmann::json&j) : nonpolar(make_nonpolar(j.at("nonpolar"))){
         if (j.contains("association")){
-            association.emplace(make_association(j.at("association")));
+            // von Solms consistency: when the hard-sphere term is the simplified
+            // single-eta form, the association radial distribution g^hs must use
+            // the SAME simplified contact value (g^hs flows to all consumers). 
+            // Override the association block's radial_dist (which
+            // lives under model.options, see Association::get_association_options)
+            // to "vonSolms" unless the user pinned one explicitly.
+            nlohmann::json assoc = j.at("association");
+            if (nonpolar_is_vonsolms_hs() && assoc.contains("model")) {
+                auto& amodel = assoc.at("model");
+                const bool user_set =
+                    amodel.contains("options")
+                    && amodel.at("options").contains("radial_dist");
+                if (!user_set) {
+                    amodel["options"]["radial_dist"] = "vonSolms";
+                }
+            }
+            association.emplace(make_association(assoc));
         }
     }
     
