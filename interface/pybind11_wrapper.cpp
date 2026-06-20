@@ -541,6 +541,7 @@ void init_teqp(py::module& m) {
         .def("get_pr", &am::get_pr, "T"_a, "rhovec"_a.noconvert())
         .def("get_splus", &am::get_splus, "T"_a, "rhovec"_a.noconvert())
         .def("build_Psir_Hessian_autodiff", &am::build_Psir_Hessian_autodiff, "T"_a, "rhovec"_a.noconvert())
+        .def("build_Psir_fgradHessian_autodiff", &am::build_Psir_fgradHessian_autodiff, "T"_a, "rhovec"_a.noconvert())
         .def("build_Psi_Hessian_autodiff", &am::build_Psi_Hessian_autodiff, "T"_a, "rhovec"_a.noconvert())
         .def("build_Psir_gradient_autodiff", &am::build_Psir_gradient_autodiff, "T"_a, "rhovec"_a.noconvert())
         .def("build_d2PsirdTdrhoi_autodiff", &am::build_d2PsirdTdrhoi_autodiff, "T"_a, "rhovec"_a.noconvert())

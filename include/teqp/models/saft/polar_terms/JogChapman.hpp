@@ -187,7 +187,7 @@ public:
     /// Geometric d_ij path: the i,j,k triple sum collapses to a single
     /// sum cubed,
     ///     S = Sum_i x_i m_i x_p,i mu^2_i / d_i
-    ///     a_3 = -(5 pi^2 / 162) / (4 pi eps_0)^3 * rho_N^2 / (k_B T)^3 * I_3(eta) * S^3
+    ///     a_3 = +(5 pi^2 / 162) / (4 pi eps_0)^3 * rho_N^2 / (k_B T)^3 * I_3(eta) * S^3
     ///
     /// Arithmetic d_ij path: full O(N^3) triple sum.
     template <typename TTYPE, typename RhoType, typename EtaType, typename VecType, typename DVecType>
@@ -201,7 +201,10 @@ public:
         auto I3 = get_I3(eta);
         auto rho_N_m3 = rhoN_A3 * 1e30;
         const double pi_d = static_cast<double>(EIGEN_PI);
-        const double prefactor = -5.0 * pi_d * pi_d / 162.0
+        // F3 prefactor is POSITIVE per Abutaqiya & Marshall 2024 Eq. 10 (and
+        // Jog-Chapman 1999 / Dominik 2005 / Marshall 2019). The Pade is
+        // alpha = a2/(1 - a3/a2) with a2 < 0; a3 must be +.
+        const double prefactor = 5.0 * pi_d * pi_d / 162.0
                                   / (FOUR_PI_EPS0 * FOUR_PI_EPS0 * FOUR_PI_EPS0);
 
         if (sigmaij_rule == SigmaijRule::geometric) {
