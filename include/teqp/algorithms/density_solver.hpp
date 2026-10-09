@@ -19,8 +19,11 @@
  *
  *    - solve_density_from_guess(model, T, P, x, rho_guess, mode) -> double
  *        Warm start from a user-supplied density guess. Falls back to the
- *        cold multi-seed solve if the warm Newton fails. Returns NaN only
- *        if both paths fail.
+ *        cold multi-seed solve in ``mode`` if the warm Newton fails, and
+ *        returns NaN only if both paths fail. With mode "none" there is
+ *        no fallback: one Newton from ``eta = rho_guess * b_mix``, no
+ *        Gibbs ranking, the root that start converges on or NaN. That is
+ *        the primitive for a caller that owns its seeding policy.
  *
  *  The solver does not assume a particular model kind (cubic vs SAFT vs
  *  multifluid); it queries the model for ``b_mix`` via ``get_bmix(T, x)``
@@ -252,6 +255,16 @@ double solve_density(const Model& model,
 /// Pass mode="auto" to get the full vapor/liquid/dense sweep on fallback;
 /// pass a narrower mode (e.g. "liquid") if the caller has prior knowledge
 /// of the phase type.
+///
+/// Pass mode="none" for a single-start solve: the one Newton (with the
+/// bisection safeguard) from ``eta0 = rho_guess * b_mix``, in the model's
+/// own volume scale (``get_bmix(T, x)``), and nothing else. It returns the
+/// molar density of the root that start converges on, or NaN when it does
+/// not converge; there is no fallback and no root ranking. Which root a
+/// start reaches is then the caller's choice, so a caller that owns its
+/// seeding policy (several starts, a branch test, a Gibbs comparison)
+/// builds it on this mode. "none" is meaningful only here: it never
+/// reaches the seed table, which rejects unknown modes.
 template <typename Model>
 double solve_density_from_guess(const Model& model,
                                 double T, double P,
@@ -265,7 +278,7 @@ double solve_density_from_guess(const Model& model,
     const double eta0 = rho_guess_mol_per_m3 * b_mix;
 
     const double rho_warm = nr_eta_solve(model, T, z, b_mix, zb, eta0);
-    if (!std::isnan(rho_warm)) return rho_warm;
+    if (!std::isnan(rho_warm) || mode == "none") return rho_warm;
 
     // Warm-start failed; fall back to cold multi-seed solve.
     return solve_density(model, T, P, z, mode);

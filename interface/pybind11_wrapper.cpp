@@ -595,7 +595,8 @@ void init_teqp(py::module& m) {
              "rho_guess"_a, "mode"_a,
              "Warm-start density solve [mol/m^3]: one Newton from rho_guess; "
              "on failure, falls back internally to the multi-seed solve in 'mode' "
-             "and picks the stable root.")
+             "and picks the stable root. With mode='none' there is no fallback: "
+             "returns the root that one Newton converges on, or NaN.")
     
         .def("get_drhovecdp_Tsat", &am::get_drhovecdp_Tsat, "T"_a, "rhovecL"_a.noconvert(), "rhovecV"_a.noconvert())
         .def("get_drhovecdT_psat", &am::get_drhovecdT_psat, "T"_a, "rhovecL"_a.noconvert(), "rhovecV"_a.noconvert())

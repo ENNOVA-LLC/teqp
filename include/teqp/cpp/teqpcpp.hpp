@@ -240,13 +240,20 @@ namespace teqp {
              *        automatically to the multi-seed solve in ``mode`` and
              *        picks the Gibbs-stable root.
              *
+             * With ``mode == "none"`` there is no fallback: the result is the
+             * root the one Newton from ``eta = rho_guess * b_mix`` (``b_mix``
+             * from ``get_bmix``) converges on, or NaN, with no root ranking. That
+             * is the primitive for a caller that owns its seeding policy.
+             *
              * \param T temperature [K]
              * \param P pressure [Pa]
              * \param molefracs composition
              * \param rho_guess warm-start density [mol/m^3]
-             * \param mode fallback mode if warm-start fails ("auto" recommended)
+             * \param mode fallback mode if warm-start fails ("auto" recommended),
+             *        or "none" for no fallback
              * \return stable molar density [mol/m^3]; NaN only if both warm
-             *         and fallback paths failed
+             *         and fallback paths failed (with "none", if the warm
+             *         Newton failed)
              */
             double solve_density_from_guess(
                 const double T, const double P, const REArrayd& molefracs,
